@@ -33,12 +33,53 @@ poll for status, then fetch the finished file.
     { "type": "wait", "ms": 2000 },
     { "type": "scroll", "pixels": 4000, "durationMs": 20000 }
   ],
-  "options": { "width": 1920, "height": 1080 },
+  "options": {
+    "orientation": "vertical",
+    "deviceScaleFactor": 2
+  },
   "session": "optional-saved-session-name"
 }
 ```
 
-Returns `202 { id, status }`.
+Returns `202 { jobId, status }`.
+
+**`options` fields (all optional):**
+- `orientation`: `"vertical"` or `"horizontal"`. Uses a real mobile
+  (iPhone-equivalent UA, touch, 1080×1920) or desktop
+  (Chrome desktop UA, 1920×1080) emulation profile — not just a resized
+  viewport — so the site actually renders its real mobile or desktop
+  layout instead of stretching one layout into the wrong-shaped window.
+- `device`: an exact Playwright device preset name (e.g. `"Pixel 5"`,
+  `"iPhone 13 Pro"`) for finer control than `orientation` gives you.
+- `width` / `height`: override the viewport dimensions of whichever
+  profile was selected above.
+- `deviceScaleFactor`: pixel density. Defaults to `2` (retina-equivalent)
+  for sharper output; raise to `3` for slightly crisper text at the cost
+  of a heavier render, or drop to `1` if you want faster/lighter jobs and
+  don't mind softer output.
+
+If no `orientation`/`device` is given, it defaults to a 1920×1080 desktop
+profile at 2x density.
+
+**On sharpness:** output uses `crf 16` / `preset slow` H.264 encoding —
+prioritizes visual quality over encode speed — combined with
+`deviceScaleFactor: 2` by default so Chromium renders at retina density
+before downsampling to the final video size. This is noticeably slower to
+encode than a faster preset; expect real encode time on top of the
+recording's own wall-clock duration.
+
+**On the cursor:** Playwright's clicks are coordinate/DOM-based — there's
+no real OS mouse pointer to record. `click`, `type`, and `search` actions
+now animate a fake on-screen cursor (a small pointer icon) gliding to the
+target element before the action fires, so the recording visibly shows
+something clicking rather than fields/buttons silently activating. This
+persists across page navigations automatically.
+
+**On the blank/white start:** the first `goto` action waits for the page's
+full `load` event (not just DOM-ready) before continuing, and the exact
+time that took is measured and trimmed off the front of the final video —
+so the output starts once the page has actually rendered, not at the
+moment the browser tab was still blank.
 
 **Supported action types:** `goto`, `wait`, `waitForSelector`, `click`,
 `type`, `search`, `scroll`, `pressKey`, `highlight`, `screenshot`. See

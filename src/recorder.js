@@ -1,17 +1,138 @@
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
+const { devices } = require('playwright'); // for device UA/mobile presets only - launch still goes through playwright-extra above
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
 chromium.use(stealth);
 
-const DEFAULT_VIEWPORT = { width: 1920, height: 1080 };
+// Real desktop and mobile emulation profiles pulled from Playwright's own
+// device database - matches Chrome DevTools' device toolbar. Using these
+// (rather than a bare width/height) is what makes a site render its actual
+// mobile or desktop layout instead of just stretching a desktop layout over
+// whatever viewport size was requested.
+const IPHONE_UA = devices['iPhone 13'].userAgent;
+const DESKTOP_UA = devices['Desktop Chrome HiDPI'].userAgent;
+
+// Playwright's click()/type() are coordinate/DOM based - there is no real OS
+// mouse pointer to record. This injects a fake cursor element into every
+// page (including after navigations, via addInitScript) plus a global
+// window.__abMoveCursorTo(x, y, instant) function used to visibly glide it
+// to a target before an action happens, so the recording actually shows
+// something clicking rather than things just silently activating.
+function cursorInitScript() {
+  const CURSOR_ID = '__autobrowse_cursor__';
+  if (document.getElementById(CURSOR_ID)) return;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    #${CURSOR_ID} {
+      position: fixed;
+      top: 0; left: 0;
+      width: 22px; height: 22px;
+      margin-left: -2px; margin-top: -2px;
+      pointer-events: none;
+      z-index: 2147483647;
+      transition: transform 400ms cubic-bezier(0.22, 0.61, 0.36, 1);
+      will-change: transform;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));
+    }
+  `;
+  document.documentElement.appendChild(style);
+
+  const cursor = document.createElement('div');
+  cursor.id = CURSOR_ID;
+  cursor.innerHTML = `
+    <svg width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
+      <path d="M2 1 L2 18 L6.5 14.5 L9.5 20.5 L12 19.3 L9 13.3 L15 13 Z"
+            fill="white" stroke="black" stroke-width="1.2" stroke-linejoin="round"/>
+    </svg>
+  `;
+  cursor.style.transform = 'translate(-100px, -100px)'; // start off-screen until first move
+  document.documentElement.appendChild(cursor);
+
+  window.__abMoveCursorTo = (x, y, instant) => {
+    const el = document.getElementById(CURSOR_ID);
+    if (!el) return;
+    el.style.transition = instant ? 'none' : 'transform 400ms cubic-bezier(0.22, 0.61, 0.36, 1)';
+    el.style.transform = `translate(${x}px, ${y}px)`;
+  };
+}
+
+// Moves the fake cursor to the center of `selector` and waits for the glide
+// animation to finish, so the click/type that follows visibly lines up with
+// where the cursor just arrived.
+async function moveCursorToElement(page, selector, timeoutMs = 15000) {
+  await page.waitForSelector(selector, { timeout: timeoutMs });
+  const center = await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }, selector);
+  if (!center) return;
+  await page.evaluate(({ x, y }) => window.__abMoveCursorTo(x, y, false), center);
+  await page.waitForTimeout(450); // let the glide animation actually play out on camera
+}
+
+/**
+ * Resolves a full device/viewport profile from the options passed to
+ * POST /record or POST /sessions. Priority:
+ *   1. options.device - exact Playwright device preset name (e.g. "Pixel 5")
+ *   2. options.orientation - "vertical" or "horizontal" convenience presets
+ *   3. options.width/height alone - plain custom viewport, desktop-like
+ *   4. default - horizontal desktop, 1920x1080 @2x (HiDPI/retina)
+ *
+ * In all cases options.width/height/deviceScaleFactor, if provided,
+ * override the corresponding field of whatever preset was chosen.
+ */
+function resolveDeviceProfile(options = {}) {
+  let profile;
+
+  if (options.device && devices[options.device]) {
+    profile = { ...devices[options.device] };
+  } else if (options.orientation === 'vertical') {
+    profile = {
+      userAgent: IPHONE_UA,
+      viewport: { width: 1080, height: 1920 },
+      deviceScaleFactor: 2,
+      isMobile: true,
+      hasTouch: true,
+    };
+  } else if (options.orientation === 'horizontal') {
+    profile = {
+      userAgent: DESKTOP_UA,
+      viewport: { width: 1920, height: 1080 },
+      deviceScaleFactor: 2,
+      isMobile: false,
+      hasTouch: false,
+    };
+  } else {
+    profile = {
+      userAgent: DESKTOP_UA,
+      viewport: { width: 1920, height: 1080 },
+      deviceScaleFactor: 2,
+      isMobile: false,
+      hasTouch: false,
+    };
+  }
+
+  if (options.width || options.height) {
+    profile.viewport = {
+      width: options.width || profile.viewport.width,
+      height: options.height || profile.viewport.height,
+    };
+  }
+  if (options.deviceScaleFactor) profile.deviceScaleFactor = options.deviceScaleFactor;
+
+  return profile;
+}
 
 /**
  * Runs a single action against the page.
  * Supported action types:
- *   { type: 'goto', url }
+ *   { type: 'goto', url, waitUntil? }              // waitUntil defaults to 'load' (full paint), not just DOM-ready
  *   { type: 'wait', ms }                          // simple pause
  *   { type: 'waitForSelector', selector, ms? }     // wait for element, optional timeout
  *   { type: 'click', selector }
@@ -27,7 +148,13 @@ async function runAction(page, action) {
 
   switch (type) {
     case 'goto': {
-      await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: action.timeoutMs || 30000 });
+      // 'load' waits for the full load event (images/CSS/fonts included),
+      // not just DOM-ready - this is what actually reduces the blank/white
+      // time at the start of a recording. Still not "pixel perfect fully
+      // painted" for every site (some content loads async after 'load'
+      // too), which is why runRecordingJob also trims by measured duration
+      // as a second layer of defense.
+      await page.goto(action.url, { waitUntil: action.waitUntil || 'load', timeout: action.timeoutMs || 30000 });
       break;
     }
 
@@ -42,11 +169,13 @@ async function runAction(page, action) {
     }
 
     case 'click': {
+      await moveCursorToElement(page, action.selector, action.timeoutMs);
       await page.click(action.selector, { timeout: action.timeoutMs || 15000 });
       break;
     }
 
     case 'type': {
+      await moveCursorToElement(page, action.selector, action.timeoutMs);
       await page.fill(action.selector, ''); // clear first
       await page.type(action.selector, action.text, { delay: action.delayMs || 30 });
       break;
@@ -54,7 +183,7 @@ async function runAction(page, action) {
 
     case 'search': {
       const selector = action.selector || 'input[type="search"], textarea[name="q"], input[name="q"]';
-      await page.waitForSelector(selector, { timeout: 15000 });
+      await moveCursorToElement(page, selector);
       await page.click(selector);
       await page.type(selector, action.text, { delay: action.delayMs || 40 });
       await page.keyboard.press('Enter');
@@ -143,22 +272,29 @@ async function runAction(page, action) {
  * one breaks, you (or an agent) update the action list based on what the
  * partial video/screenshots show, same as any other code fix.
  *
+ * Options accepted (all optional):
+ *   options.orientation: "vertical" | "horizontal"  - convenience device presets
+ *   options.device: exact Playwright device preset name, e.g. "Pixel 5"
+ *   options.width / options.height: override viewport dimensions
+ *   options.deviceScaleFactor: override pixel density (2 = retina; higher = sharper but heavier)
+ *
  * onLog(line) is called with progress strings for storage in job metadata.
  */
 async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}, storageStatePath = null }) {
-  const viewport = {
-    width: options.width || DEFAULT_VIEWPORT.width,
-    height: options.height || DEFAULT_VIEWPORT.height,
-  };
+  const deviceProfile = resolveDeviceProfile(options);
 
   fs.mkdirSync(jobDir, { recursive: true });
 
-  onLog('Launching headless Chromium (stealth)');
+  onLog(`Launching headless Chromium (stealth), viewport ${deviceProfile.viewport.width}x${deviceProfile.viewport.height} @${deviceProfile.deviceScaleFactor}x`);
   const browser = await chromium.launch({ headless: true });
 
   const contextOptions = {
-    viewport,
-    recordVideo: { dir: jobDir, size: viewport },
+    ...deviceProfile,
+    // Video is recorded at the same logical size as the viewport. Chromium
+    // still renders internally at deviceScaleFactor resolution, so text and
+    // edges come out anti-aliased/sharper than a flat 1x capture even
+    // though the final pixel dimensions match the viewport.
+    recordVideo: { dir: jobDir, size: deviceProfile.viewport },
   };
   if (storageStatePath && fs.existsSync(storageStatePath)) {
     onLog('Reusing saved session cookies');
@@ -167,10 +303,12 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
 
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
+  await page.addInitScript(cursorInitScript); // re-injects on every goto/navigation, not just the first page load
 
   const screenshots = [];
   let actionError = null;
   let failedAtIndex = null;
+  let leadingLoadMs = 0;
 
   for (const [i, action] of actions.entries()) {
     onLog(`Action ${i + 1}/${actions.length}: ${action.type}`);
@@ -179,7 +317,16 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
       const enrichedAction = action.type === 'screenshot'
         ? { ...action, _jobDir: jobDir, _onScreenshot: (name) => screenshots.push(name) }
         : action;
-      await runAction(page, enrichedAction);
+
+      // Measure only the very first action if it's a `goto` - this is the
+      // "blank tab" time we trim from the front of the final video below.
+      if (i === 0 && action.type === 'goto') {
+        const start = Date.now();
+        await runAction(page, enrichedAction);
+        leadingLoadMs = Date.now() - start;
+      } else {
+        await runAction(page, enrichedAction);
+      }
     } catch (err) {
       actionError = err.message;
       failedAtIndex = i;
@@ -199,23 +346,48 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
   }
 
   const mp4Path = path.join(jobDir, 'output.mp4');
-  onLog('Converting webm -> mp4');
-  await convertToMp4(webmPath, mp4Path);
+  // Trim off the initial page-load time so the video starts once the site
+  // has actually rendered, instead of a few seconds of blank tab. Small
+  // buffer subtracted so we don't cut into the very first visible frame.
+  const trimSeconds = leadingLoadMs > 300 ? Math.max(0, (leadingLoadMs - 150) / 1000) : 0;
+  onLog(trimSeconds > 0
+    ? `Converting webm -> mp4 (trimming ${trimSeconds.toFixed(2)}s of initial load time)`
+    : 'Converting webm -> mp4');
+  await convertToMp4(webmPath, mp4Path, trimSeconds);
   fs.unlink(webmPath, () => {}); // clean up the intermediate webm now that we have the mp4
 
   return { outputPath: mp4Path, screenshots, actionError, failedAtIndex };
 }
 
-function convertToMp4(inputPath, outputPath) {
+/**
+ * Converts the raw .webm recording to .mp4, optionally trimming
+ * `trimSeconds` off the start. -ss is placed AFTER -i (an "output" seek)
+ * so the cut is frame-accurate rather than snapping to the nearest
+ * keyframe - important since we're only trimming a second or two.
+ *
+ * Quality settings: crf 16 + preset "slow" prioritize sharpness over encode
+ * speed. This is noticeably slower than "medium"/crf 18 on a CPU-only VPS -
+ * a 30s clip that took ~15-20s to encode at medium/18 may take closer to
+ * 40-60s at slow/16. If jobs start queuing up badly under load, "medium"
+ * is the first lever to pull back; crf 16 is close to visually lossless
+ * for screen-recording-style content, so there's little to gain going lower.
+ */
+function convertToMp4(inputPath, outputPath, trimSeconds = 0) {
+  const args = ['-y', '-i', inputPath];
+  if (trimSeconds > 0) args.push('-ss', trimSeconds.toFixed(3));
+  args.push(
+    '-c:v', 'libx264',
+    '-preset', 'slow',
+    '-crf', '16',
+    '-pix_fmt', 'yuv420p',
+    outputPath
+  );
+
   return new Promise((resolve, reject) => {
-    execFile(
-      'ffmpeg',
-      ['-y', '-i', inputPath, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', outputPath],
-      (err, stdout, stderr) => {
-        if (err) return reject(new Error(`ffmpeg failed: ${stderr || err.message}`));
-        resolve(outputPath);
-      }
-    );
+    execFile('ffmpeg', args, (err, stdout, stderr) => {
+      if (err) return reject(new Error(`ffmpeg failed: ${stderr || err.message}`));
+      resolve(outputPath);
+    });
   });
 }
 
@@ -227,14 +399,11 @@ function convertToMp4(inputPath, outputPath) {
  * to disk or logged. Only the resulting session state is persisted.
  */
 async function createSession({ actions, options = {}, storageStatePath, onLog = () => {} }) {
-  const viewport = {
-    width: options.width || DEFAULT_VIEWPORT.width,
-    height: options.height || DEFAULT_VIEWPORT.height,
-  };
+  const deviceProfile = resolveDeviceProfile(options);
 
   onLog('Launching headless Chromium (stealth) for one-off session login');
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ viewport });
+  const context = await browser.newContext(deviceProfile);
   const page = await context.newPage();
 
   try {
