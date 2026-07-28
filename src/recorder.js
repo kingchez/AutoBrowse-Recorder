@@ -244,7 +244,7 @@ async function runAction(page, action) {
     }
 
     case 'search': {
-      const selector = action.selector || 'input[type="search"], textarea[name="q"], input[name="q"]';
+      const selector = action.selector || 'input[type="search"], input[name="s"], textarea[name="q"], input[name="q"]';
       if (action.zoom) await zoomToElement(page, selector, action.zoom, action.zoomDurationMs);
       await moveCursorToElement(page, selector);
       await page.click(selector);
