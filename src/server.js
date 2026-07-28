@@ -2,16 +2,25 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
-const { runRecordingJob } = require('./recorder');
+const { runRecordingJob, createSession } = require('./recorder');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 3000;
 const JOBS_ROOT = process.env.JOBS_DIR || path.join(__dirname, '..', 'data', 'jobs');
+const SESSIONS_ROOT = process.env.SESSIONS_DIR || path.join(__dirname, '..', 'data', 'sessions');
 const PRUNE_AFTER_HOURS = Number(process.env.PRUNE_AFTER_HOURS || 48);
 
 fs.mkdirSync(JOBS_ROOT, { recursive: true });
+fs.mkdirSync(SESSIONS_ROOT, { recursive: true });
+
+function sessionPathFor(name) {
+  // Guard against path traversal via the session name.
+  const safe = String(name).replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safe) throw new Error('Invalid session name');
+  return path.join(SESSIONS_ROOT, `${safe}.json`);
+}
 
 // In-memory job registry. Rebuilt from disk on boot so restarts don't lose track
 // of jobs that already finished (mirrors the render server's mtime-based recovery).
@@ -54,10 +63,22 @@ function saveMeta(id) {
 // POST /record  { actions: [...], options?: { width, height } }
 // Returns immediately with a job id; recording happens async since it's wall-clock bound.
 app.post('/record', (req, res) => {
-  const { actions, options } = req.body || {};
+  const { actions, options, session } = req.body || {};
 
   if (!Array.isArray(actions) || actions.length === 0) {
     return res.status(400).json({ error: 'Body must include a non-empty "actions" array' });
+  }
+
+  let storageStatePath = null;
+  if (session) {
+    try {
+      storageStatePath = sessionPathFor(session);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (!fs.existsSync(storageStatePath)) {
+      return res.status(404).json({ error: `No saved session named "${session}". Create it first via POST /sessions.` });
+    }
   }
 
   const id = uuidv4();
@@ -71,7 +92,7 @@ app.post('/record', (req, res) => {
     saveMeta(id);
   };
 
-  runRecordingJob({ actions, options, jobDir: dir, onLog })
+  runRecordingJob({ actions, options, jobDir: dir, onLog, storageStatePath })
     .then(() => {
       job.status = 'completed';
       saveMeta(id);
@@ -117,6 +138,64 @@ app.get('/recordings/:id/output', (req, res) => {
   });
   stream.on('error', (err) => {
     if (!res.headersSent) res.status(500).json({ error: err.message });
+  });
+});
+
+// POST /sessions  { name: "n8n-main", actions: [...login steps...] }
+// Runs the given actions ONCE (e.g. a login form) and saves the resulting
+// cookies/localStorage under that name. The actions themselves (which may
+// contain a password in a `type` step) are used only in-memory for this
+// request and are never written to disk, logged, or echoed back.
+app.post('/sessions', async (req, res) => {
+  const { name, actions, options } = req.body || {};
+
+  if (!name || typeof name !== 'string') {
+    return res.status(400).json({ error: 'Body must include a "name" string' });
+  }
+  if (!Array.isArray(actions) || actions.length === 0) {
+    return res.status(400).json({ error: 'Body must include a non-empty "actions" array' });
+  }
+
+  let storageStatePath;
+  try {
+    storageStatePath = sessionPathFor(name);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  const log = [];
+  try {
+    await createSession({
+      actions,
+      options,
+      storageStatePath,
+      onLog: (line) => log.push(line),
+    });
+    res.json({ name, status: 'saved', log });
+  } catch (err) {
+    res.status(500).json({ error: err.message, log });
+  }
+});
+
+// GET /sessions -> list saved session names only (never the cookie contents)
+app.get('/sessions', (_req, res) => {
+  const names = fs.existsSync(SESSIONS_ROOT)
+    ? fs.readdirSync(SESSIONS_ROOT).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, ''))
+    : [];
+  res.json({ sessions: names });
+});
+
+// DELETE /sessions/:name -> revoke a saved session (e.g. after it expires or you log out elsewhere)
+app.delete('/sessions/:name', (req, res) => {
+  let storageStatePath;
+  try {
+    storageStatePath = sessionPathFor(req.params.name);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  fs.rm(storageStatePath, { force: true }, (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ name: req.params.name, status: 'deleted' });
   });
 });
 

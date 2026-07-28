@@ -89,7 +89,7 @@ async function runAction(page, action) {
  *
  * onLog(line) is called with progress strings for storage in job metadata.
  */
-async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {} }) {
+async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}, storageStatePath = null }) {
   const viewport = {
     width: options.width || DEFAULT_VIEWPORT.width,
     height: options.height || DEFAULT_VIEWPORT.height,
@@ -100,10 +100,16 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
   onLog('Launching headless Chromium (stealth)');
   const browser = await chromium.launch({ headless: true });
 
-  const context = await browser.newContext({
+  const contextOptions = {
     viewport,
     recordVideo: { dir: jobDir, size: viewport },
-  });
+  };
+  if (storageStatePath && fs.existsSync(storageStatePath)) {
+    onLog('Reusing saved session cookies');
+    contextOptions.storageState = storageStatePath;
+  }
+
+  const context = await browser.newContext(contextOptions);
 
   const page = await context.newPage();
 
@@ -148,4 +154,38 @@ function convertToMp4(inputPath, outputPath) {
   });
 }
 
-module.exports = { runRecordingJob };
+/**
+ * Runs a one-off login (or any action list) with NO video recording, then
+ * saves the resulting cookies/localStorage to storageStatePath. The actual
+ * credentials passed in `actions` (e.g. a `type` action filling a password
+ * field) are used only in-memory for this single run and are never written
+ * to disk or logged. Only the resulting session state is persisted.
+ */
+async function createSession({ actions, options = {}, storageStatePath, onLog = () => {} }) {
+  const viewport = {
+    width: options.width || DEFAULT_VIEWPORT.width,
+    height: options.height || DEFAULT_VIEWPORT.height,
+  };
+
+  onLog('Launching headless Chromium (stealth) for one-off session login');
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport });
+  const page = await context.newPage();
+
+  try {
+    for (const [i, action] of actions.entries()) {
+      // Deliberately do NOT log action payloads here (they may contain
+      // a password in a `type` action) — only the type/index.
+      onLog(`Session action ${i + 1}/${actions.length}: ${action.type}`);
+      await runAction(page, action);
+    }
+    fs.mkdirSync(path.dirname(storageStatePath), { recursive: true });
+    await context.storageState({ path: storageStatePath });
+    onLog('Session saved');
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+}
+
+module.exports = { runRecordingJob, createSession };

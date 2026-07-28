@@ -14,12 +14,13 @@ RUN npm install --omit=dev
 
 COPY src ./src
 
-# Where in-progress and finished job files live (video + metadata)
-RUN mkdir -p /app/data/jobs
+# Where in-progress/finished job files and saved login sessions live
+RUN mkdir -p /app/data/jobs /app/data/sessions
 
 ENV PORT=3000
 ENV JOBS_DIR=/app/data/jobs
-# Auto-prune undelivered outputs after this many hours (mirrors render server's 2-day prune)
+ENV SESSIONS_DIR=/app/data/sessions
+# Auto-prune undelivered outputs after this many hours
 ENV PRUNE_AFTER_HOURS=48
 
 EXPOSE 3000
