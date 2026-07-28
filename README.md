@@ -72,8 +72,11 @@ recording's own wall-clock duration.
 no real OS mouse pointer to record. `click`, `type`, and `search` actions
 now animate a fake on-screen cursor (a small pointer icon) gliding to the
 target element before the action fires, so the recording visibly shows
-something clicking rather than fields/buttons silently activating. This
-persists across page navigations automatically.
+something clicking rather than fields/buttons silently activating. The
+cursor script is re-injected defensively right before each use (not just
+relied on via `addInitScript`), so it stays working even if a page does an
+internal redirect or otherwise replaces the document in a way that skips
+the normal re-injection.
 
 **On the blank/white start:** the first `goto` action waits for the page's
 full `load` event (not just DOM-ready) before continuing, and the exact
@@ -99,8 +102,8 @@ longer explicit `wait`, or better, a `waitForSelector` on an element that
 only appears once the page is genuinely done rendering.
 
 **Supported action types:** `goto`, `wait`, `waitForSelector`, `click`,
-`type`, `search`, `scroll`, `pressKey`, `highlight`, `screenshot`. See
-`src/recorder.js` for exact parameters of each.
+`type`, `search`, `scroll`, `pressKey`, `highlight`, `screenshot`,
+`zoomIn`, `zoomOut`. See `src/recorder.js` for exact parameters of each.
 
 - `highlight` draws a colored box around an element for a moment before
   continuing — useful so the recording visibly shows what's about to be
@@ -108,6 +111,16 @@ only appears once the page is genuinely done rendering.
 - `screenshot` saves a still PNG alongside the video. Screenshots are
   listed in the `GET /recordings/:id` response under `screenshots` (an
   array of fetch URLs) once the job reaches a status with output.
+- **Zoom:** `zoomIn` (`{ selector, scale?, durationMs? }`) and `zoomOut`
+  (`{ durationMs? }`) push the camera in/out on any element — a CSS scale
+  transform centered on that element, like a slow zoom on a chart or a
+  headline. `scale` defaults to `1.5`, `durationMs` to `600`.
+  For the common case — zoom in specifically to click or type into
+  something — `click`, `type`, and `search` accept an optional `zoom`
+  field directly: `{ "type": "click", "selector": "...", "zoom": 1.6 }`
+  zooms in, performs the click, holds briefly (`zoomHoldMs`, default
+  `400`ms), then zooms back out automatically. Pass `"zoomOut": false` if
+  you want to stay zoomed in going into the next action instead.
 
 ### `GET /recordings/:id`
 

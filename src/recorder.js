@@ -60,11 +60,56 @@ function cursorInitScript() {
   };
 }
 
+// Zooms the whole page in on `selector` by applying a CSS scale transform
+// with its origin centered on that element - like a camera push-in. This
+// affects layout visually only (the transform doesn't change actual DOM
+// geometry beyond what CSS transforms always do), and Playwright's own
+// click()/evaluate() hit-testing correctly accounts for the transform, so
+// clicking after a zoom still targets the right (now larger) element.
+async function zoomToElement(page, selector, scale = 1.5, durationMs = 600) {
+  await page.waitForSelector(selector, { timeout: 15000 });
+  await page.evaluate(({ selector, scale, durationMs }) => {
+    const el = document.querySelector(selector);
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const originX = ((rect.left + rect.width / 2) / window.innerWidth) * 100;
+    const originY = ((rect.top + rect.height / 2) / window.innerHeight) * 100;
+    const html = document.documentElement;
+    html.style.transition = `transform ${durationMs}ms ease-in-out`;
+    html.style.transformOrigin = `${originX}% ${originY}%`;
+    html.style.transform = `scale(${scale})`;
+    html.style.overflow = 'hidden'; // avoid scrollbars/edge artifacts while zoomed
+  }, { selector, scale, durationMs });
+  await page.waitForTimeout(durationMs);
+}
+
+// Reverses zoomToElement back to scale(1), same transition duration.
+async function zoomReset(page, durationMs = 600) {
+  await page.evaluate((durationMs) => {
+    const html = document.documentElement;
+    html.style.transition = `transform ${durationMs}ms ease-in-out`;
+    html.style.transform = 'scale(1)';
+  }, durationMs);
+  await page.waitForTimeout(durationMs);
+  await page.evaluate(() => {
+    document.documentElement.style.overflow = '';
+  });
+}
+
 // Moves the fake cursor to the center of `selector` and waits for the glide
 // animation to finish, so the click/type that follows visibly lines up with
 // where the cursor just arrived.
+//
+// Defensively re-runs cursorInitScript() via page.evaluate right before use
+// (it's idempotent - the early "already exists" check inside it makes this
+// a no-op if the cursor is already there). page.addInitScript() *should*
+// make this unnecessary on its own, but a site doing an internal redirect
+// or replacing the document in a way that doesn't cleanly re-fire it can
+// leave window.__abMoveCursorTo undefined - this guarantees it exists
+// regardless of why that happened.
 async function moveCursorToElement(page, selector, timeoutMs = 15000) {
   await page.waitForSelector(selector, { timeout: timeoutMs });
+  await page.evaluate(cursorInitScript);
   const center = await page.evaluate((sel) => {
     const el = document.querySelector(sel);
     if (!el) return null;
@@ -135,13 +180,20 @@ function resolveDeviceProfile(options = {}) {
  *   { type: 'goto', url, waitUntil? }              // waitUntil defaults to 'load' (full paint), not just DOM-ready
  *   { type: 'wait', ms }                          // simple pause
  *   { type: 'waitForSelector', selector, ms? }     // wait for element, optional timeout
- *   { type: 'click', selector }
- *   { type: 'type', selector, text, delayMs? }
- *   { type: 'search', selector?, text }            // types into selector (or common search inputs) + presses Enter
+ *   { type: 'click', selector, zoom?, zoomDurationMs?, zoomHoldMs?, zoomOut? }
+ *   { type: 'type', selector, text, delayMs?, zoom?, zoomDurationMs?, zoomHoldMs?, zoomOut? }
+ *   { type: 'search', selector?, text, zoom?, zoomDurationMs?, zoomHoldMs?, zoomOut? }
  *   { type: 'scroll', pixels, durationMs? }        // smooth-scrolls by pixels over durationMs (default: instant-ish steps)
  *   { type: 'pressKey', key }                      // e.g. 'Enter', 'Escape'
  *   { type: 'highlight', selector, color?, durationMs? }  // draws a colored box around an element briefly
  *   { type: 'screenshot', filename?, fullPage? }   // saves a still PNG alongside the video
+ *   { type: 'zoomIn', selector, scale?, durationMs? }   // CSS-transform zoom-in centered on an element (camera push-in)
+ *   { type: 'zoomOut', durationMs? }               // reverses zoomIn back to scale(1)
+ *
+ * `zoom` on click/type/search is shorthand for: zoom in on that element,
+ * perform the action, briefly hold (zoomHoldMs, default 400ms), then zoom
+ * back out (unless zoomOut: false, e.g. if you want to stay zoomed in for
+ * a following action).
  */
 async function runAction(page, action) {
   const { type } = action;
@@ -169,29 +221,56 @@ async function runAction(page, action) {
     }
 
     case 'click': {
+      if (action.zoom) await zoomToElement(page, action.selector, action.zoom, action.zoomDurationMs);
       await moveCursorToElement(page, action.selector, action.timeoutMs);
       await page.click(action.selector, { timeout: action.timeoutMs || 15000 });
+      if (action.zoom && action.zoomOut !== false) {
+        await page.waitForTimeout(action.zoomHoldMs || 400); // brief hold on the clicked result before pulling back out
+        await zoomReset(page, action.zoomDurationMs);
+      }
       break;
     }
 
     case 'type': {
+      if (action.zoom) await zoomToElement(page, action.selector, action.zoom, action.zoomDurationMs);
       await moveCursorToElement(page, action.selector, action.timeoutMs);
       await page.fill(action.selector, ''); // clear first
       await page.type(action.selector, action.text, { delay: action.delayMs || 30 });
+      if (action.zoom && action.zoomOut !== false) {
+        await page.waitForTimeout(action.zoomHoldMs || 400);
+        await zoomReset(page, action.zoomDurationMs);
+      }
       break;
     }
 
     case 'search': {
       const selector = action.selector || 'input[type="search"], textarea[name="q"], input[name="q"]';
+      if (action.zoom) await zoomToElement(page, selector, action.zoom, action.zoomDurationMs);
       await moveCursorToElement(page, selector);
       await page.click(selector);
       await page.type(selector, action.text, { delay: action.delayMs || 40 });
       await page.keyboard.press('Enter');
+      if (action.zoom && action.zoomOut !== false) {
+        await page.waitForTimeout(action.zoomHoldMs || 400);
+        await zoomReset(page, action.zoomDurationMs);
+      }
       break;
     }
 
     case 'pressKey': {
       await page.keyboard.press(action.key);
+      break;
+    }
+
+    // Standalone zoom control, for zooming on any area independent of a
+    // click/search - e.g. to linger on a chart or a piece of text.
+    case 'zoomIn': {
+      await zoomToElement(page, action.selector, action.scale || 1.5, action.durationMs || 600);
+      break;
+    }
+
+    case 'zoomOut': {
+      await zoomReset(page, action.durationMs || 600);
       break;
     }
 
