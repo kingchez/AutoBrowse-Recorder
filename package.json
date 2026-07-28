@@ -1,0 +1,17 @@
+{
+  "name": "autobrowse-recorder",
+  "version": "1.0.0",
+  "description": "Headless browser automation + video recording API service (Playwright + stealth), job-based like render/whisperx servers.",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "playwright": "^1.47.0",
+    "uuid": "^9.0.1"
+  }
+}
