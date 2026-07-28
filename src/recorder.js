@@ -309,6 +309,11 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
   let actionError = null;
   let failedAtIndex = null;
   let leadingLoadMs = 0;
+  // Once a non-goto, non-wait action happens, the "settling in" period is
+  // over and nothing further gets trimmed - this only ever covers a
+  // contiguous prefix at the very start of the action list.
+  let stillInLeadingPrefix = true;
+  const trimLeadingWaits = options.trimLeadingWaits !== false; // opt-out via options.trimLeadingWaits: false
 
   for (const [i, action] of actions.entries()) {
     onLog(`Action ${i + 1}/${actions.length}: ${action.type}`);
@@ -318,13 +323,15 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
         ? { ...action, _jobDir: jobDir, _onScreenshot: (name) => screenshots.push(name) }
         : action;
 
-      // Measure only the very first action if it's a `goto` - this is the
-      // "blank tab" time we trim from the front of the final video below.
-      if (i === 0 && action.type === 'goto') {
+      const isLeadingGoto = i === 0 && action.type === 'goto';
+      const isLeadingWait = stillInLeadingPrefix && i > 0 && action.type === 'wait' && trimLeadingWaits;
+
+      if (isLeadingGoto || isLeadingWait) {
         const start = Date.now();
         await runAction(page, enrichedAction);
-        leadingLoadMs = Date.now() - start;
+        leadingLoadMs += Date.now() - start;
       } else {
+        stillInLeadingPrefix = false; // first non-goto/non-wait action ends the trimmable prefix
         await runAction(page, enrichedAction);
       }
     } catch (err) {

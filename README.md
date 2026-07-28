@@ -81,6 +81,23 @@ time that took is measured and trimmed off the front of the final video —
 so the output starts once the page has actually rendered, not at the
 moment the browser tab was still blank.
 
+This trim also extends to cover any `wait` actions placed immediately
+after that first `goto` (a common pattern for giving a site extra time to
+settle/hydrate) — the whole `goto` + leading `wait`(s) block is treated as
+"page settling", not part of the intended footage, and is trimmed
+together. The trim stops as soon as it hits the first action that isn't a
+`goto` or leading `wait` (a `scroll`, `click`, etc.). If you actually want
+an initial wait to show up in the recording (e.g. showing a loading
+skeleton on purpose), set `"options": { "trimLeadingWaits": false }` to
+disable this and only trim the bare `goto` time.
+
+Note this only trims *measured dead time up to that point* — it can't
+detect content that's still visually settling after the `load` event fires
+(common on JS-heavy sites doing client-side rendering after the initial
+load). If you're still seeing content pop in after the trim, the fix is a
+longer explicit `wait`, or better, a `waitForSelector` on an element that
+only appears once the page is genuinely done rendering.
+
 **Supported action types:** `goto`, `wait`, `waitForSelector`, `click`,
 `type`, `search`, `scroll`, `pressKey`, `highlight`, `screenshot`. See
 `src/recorder.js` for exact parameters of each.
