@@ -1,6 +1,9 @@
 # Official Playwright image ships Chromium/Firefox/WebKit + all system deps preinstalled.
-# Pin to a version that matches the playwright npm package in package.json.
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+# IMPORTANT: this tag's version must exactly match the "playwright" version pinned
+# in package.json (no caret/range there) - the npm package and the browser
+# binaries baked into this image have to be the same version or the container
+# fails at launch with "Executable doesn't exist". If you bump one, bump both.
+FROM mcr.microsoft.com/playwright:v1.62.0-jammy
 
 # ffmpeg is needed to convert Playwright's .webm output to .mp4
 RUN apt-get update && \
@@ -9,8 +12,8 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY src ./src
 
