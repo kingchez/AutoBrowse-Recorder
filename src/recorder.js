@@ -19,6 +19,8 @@ const DEFAULT_VIEWPORT = { width: 1920, height: 1080 };
  *   { type: 'search', selector?, text }            // types into selector (or common search inputs) + presses Enter
  *   { type: 'scroll', pixels, durationMs? }        // smooth-scrolls by pixels over durationMs (default: instant-ish steps)
  *   { type: 'pressKey', key }                      // e.g. 'Enter', 'Escape'
+ *   { type: 'highlight', selector, color?, durationMs? }  // draws a colored box around an element briefly
+ *   { type: 'screenshot', filename?, fullPage? }   // saves a still PNG alongside the video
  */
 async function runAction(page, action) {
   const { type } = action;
@@ -78,6 +80,51 @@ async function runAction(page, action) {
       break;
     }
 
+    // Draws a colored box around an element for a moment before continuing.
+    // Useful so you (or a viewer) can see exactly what's about to be
+    // clicked, rather than the click just silently happening off-screen.
+    case 'highlight': {
+      const color = action.color || '#ff3b30';
+      const durationMs = action.durationMs || 800;
+      await page.waitForSelector(action.selector, { timeout: action.timeoutMs || 15000 });
+      await page.evaluate(({ selector, color }) => {
+        const el = document.querySelector(selector);
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const box = document.createElement('div');
+        box.setAttribute('data-autobrowse-highlight', 'true');
+        Object.assign(box.style, {
+          position: 'fixed',
+          left: `${rect.left - 4}px`,
+          top: `${rect.top - 4}px`,
+          width: `${rect.width + 8}px`,
+          height: `${rect.height + 8}px`,
+          border: `3px solid ${color}`,
+          borderRadius: '6px',
+          boxShadow: `0 0 0 3px ${color}33`,
+          zIndex: 2147483647,
+          pointerEvents: 'none',
+        });
+        document.body.appendChild(box);
+      }, { selector: action.selector, color });
+      await page.waitForTimeout(durationMs);
+      await page.evaluate(() => {
+        document.querySelectorAll('[data-autobrowse-highlight]').forEach((el) => el.remove());
+      });
+      break;
+    }
+
+    // Saves a still PNG into the job's directory (in addition to the video).
+    // action._jobDir and action._onScreenshot are injected by runRecordingJob,
+    // not something the caller needs to supply.
+    case 'screenshot': {
+      const filename = action.filename || `screenshot-${Date.now()}.png`;
+      const filePath = path.join(action._jobDir, filename);
+      await page.screenshot({ path: filePath, fullPage: action.fullPage || false });
+      if (typeof action._onScreenshot === 'function') action._onScreenshot(filename);
+      break;
+    }
+
     default:
       throw new Error(`Unknown action type: ${type}`);
   }
@@ -86,6 +133,15 @@ async function runAction(page, action) {
 /**
  * Runs a full job: launches a stealth Chromium instance, records the browser
  * context to .webm, executes the action list in order, then converts to .mp4.
+ *
+ * Important: if an action fails partway (e.g. a selector no longer matches
+ * after a site redesign), this does NOT throw and discard everything - it
+ * still finalizes and converts whatever was recorded up to that point, and
+ * returns { outputPath, screenshots, actionError }. That way a broken
+ * selector gets you a partial video showing exactly where it broke, instead
+ * of nothing at all. There is no self-healing/relearning of selectors - if
+ * one breaks, you (or an agent) update the action list based on what the
+ * partial video/screenshots show, same as any other code fix.
  *
  * onLog(line) is called with progress strings for storage in job metadata.
  */
@@ -110,35 +166,44 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
   }
 
   const context = await browser.newContext(contextOptions);
-
   const page = await context.newPage();
 
-  try {
-    for (const [i, action] of actions.entries()) {
-      onLog(`Action ${i + 1}/${actions.length}: ${action.type}`);
-      await runAction(page, action);
+  const screenshots = [];
+  let actionError = null;
+  let failedAtIndex = null;
+
+  for (const [i, action] of actions.entries()) {
+    onLog(`Action ${i + 1}/${actions.length}: ${action.type}`);
+    try {
+      // Inject job dir + screenshot tracking without requiring the caller to know about it.
+      const enrichedAction = action.type === 'screenshot'
+        ? { ...action, _jobDir: jobDir, _onScreenshot: (name) => screenshots.push(name) }
+        : action;
+      await runAction(page, enrichedAction);
+    } catch (err) {
+      actionError = err.message;
+      failedAtIndex = i;
+      onLog(`Action ${i + 1} FAILED: ${err.message} - stopping here, finalizing partial recording`);
+      break; // stop executing further actions, but still fall through to finalize below
     }
-  } finally {
-    // Video only finalizes once the context (and its page) close.
-    onLog('Finalizing recording');
-    const video = page.video();
-    await context.close();
-    await browser.close();
-
-    const webmPath = video ? await video.path() : null;
-    if (!webmPath || !fs.existsSync(webmPath)) {
-      throw new Error('Recording failed: no video file was produced');
-    }
-
-    const mp4Path = path.join(jobDir, 'output.mp4');
-    onLog('Converting webm -> mp4');
-    await convertToMp4(webmPath, mp4Path);
-
-    // Clean up the intermediate webm now that we have the mp4
-    fs.unlink(webmPath, () => {});
-
-    return mp4Path;
   }
+
+  onLog('Finalizing recording');
+  const video = page.video();
+  await context.close();
+  await browser.close();
+
+  const webmPath = video ? await video.path() : null;
+  if (!webmPath || !fs.existsSync(webmPath)) {
+    throw new Error('Recording failed: no video file was produced');
+  }
+
+  const mp4Path = path.join(jobDir, 'output.mp4');
+  onLog('Converting webm -> mp4');
+  await convertToMp4(webmPath, mp4Path);
+  fs.unlink(webmPath, () => {}); // clean up the intermediate webm now that we have the mp4
+
+  return { outputPath: mp4Path, screenshots, actionError, failedAtIndex };
 }
 
 function convertToMp4(inputPath, outputPath) {

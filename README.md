@@ -41,18 +41,36 @@ poll for status, then fetch the finished file.
 Returns `202 { id, status }`.
 
 **Supported action types:** `goto`, `wait`, `waitForSelector`, `click`,
-`type`, `search`, `scroll`, `pressKey`. See `src/recorder.js` for exact
-parameters of each.
+`type`, `search`, `scroll`, `pressKey`, `highlight`, `screenshot`. See
+`src/recorder.js` for exact parameters of each.
+
+- `highlight` draws a colored box around an element for a moment before
+  continuing — useful so the recording visibly shows what's about to be
+  clicked, rather than a click just silently happening.
+- `screenshot` saves a still PNG alongside the video. Screenshots are
+  listed in the `GET /recordings/:id` response under `screenshots` (an
+  array of fetch URLs) once the job reaches a status with output.
 
 ### `GET /recordings/:id`
 
-Returns `{ id, status, log, error? }`. `status` is one of `processing`,
-`completed`, `failed`.
+Returns `{ jobId, status, log, error?, output_url?, screenshots? }`.
+`status` is one of `pending`, `processing`, `done`, `error`.
+`output_url` appears as soon as there's a video to fetch — **including on
+`error`** if an action failed partway through (see "selector breaks" below,
+this gives you the partial recording instead of nothing).
 
 ### `GET /recordings/:id/output`
 
-Streams the MP4 if `status === "completed"`. 409 if not ready, 410 if
-already delivered/pruned.
+Serves the MP4 if an `output_url` was present. 409 if nothing's ready yet,
+410 if already delivered/pruned. **Deleted after successful delivery**
+(consume-on-delivery, same as the render server this mirrors) — fetch it
+once and it's gone, unless screenshots for that job are still pending
+delivery, in which case the job directory (and its screenshots) sticks
+around until those are also fetched or the job is pruned.
+
+### `GET /recordings/:id/screenshots/:filename`
+
+Serves a screenshot PNG taken mid-job via a `screenshot` action.
 
 ### Sessions (logging in once, reusing it later)
 
@@ -103,9 +121,17 @@ than a plain Node service.
   datacenter IP on repeated hits. This repo does **not** include proxy
   rotation — start without it, add residential proxies only if you
   confirm blocking is a real, recurring problem.
-- **Site changes break selectors silently.** A `click`/`waitForSelector`
-  step can fail if the target site's DOM changes. Consider a sanity check
-  before relying on output for anything downstream.
+- **Site changes break selectors — there's no self-healing.** If a
+  `click`/`waitForSelector` step no longer matches (site redesign, A/B
+  test, etc.), the job stops at that action. It does **not** try to
+  relearn or guess a new selector, and it does **not** require you to
+  describe element positions blindly either: the job still finalizes and
+  returns the video recorded up to the failure point (status `error`,
+  `output_url` still present) plus which action index failed and why, in
+  `GET /recordings/:id`. You (or an agent) look at that partial video/log,
+  see exactly what changed, and update the action list — same as fixing
+  any other code after a bug report, just with a visual instead of a
+  stack trace.
 - **Session expiry.** Saved sessions aren't refreshed automatically — if
   a site logs the session out, re-run `POST /sessions` to refresh it.
 - **ToS.** Automated recording/navigation of third-party sites is a gray
