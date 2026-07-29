@@ -67,14 +67,19 @@ function cursorInitScript() {
 // click()/evaluate() hit-testing correctly accounts for the transform, so
 // clicking after a zoom still targets the right (now larger) element.
 //
-// Uses page.waitForSelector(...).boundingBox() rather than
-// document.querySelector inside page.evaluate - the latter only
-// understands plain CSS and breaks on Playwright's own extended selector
-// engines (text=, role=, xpath=, etc.), which are otherwise valid and
-// commonly used for `selector` throughout this file.
+// KNOWN LIMITATION: CSS `transform` on an ancestor creates a new
+// containing block for any `position: fixed` descendant (e.g. a sticky
+// nav header), so such elements can visibly shift or misplace during a
+// zoom. The CSS `zoom` property doesn't have this side effect, but it
+// also doesn't support `transform-origin` at all - meaning it can only
+// ever scale from the page's top-left corner, not center on the target
+// element, which would break the actual point of this feature on every
+// single use rather than just on pages with sticky headers. Given that
+// trade-off, this keeps `transform: scale` (accurate centered zoom,
+// occasional sticky-header glitch) over `zoom` (correct on sticky headers,
+// wrong centering always).
 async function zoomToElement(page, selector, scale = 1.5, durationMs = 600) {
-  const el = await page.waitForSelector(selector, { timeout: 15000 });
-  const box = await el.boundingBox();
+  const { box } = await resolveVisibleElement(page, selector);
   if (!box) return; // element matched but isn't visible/laid out - nothing to zoom to
   const viewport = page.viewportSize();
   const originX = ((box.x + box.width / 2) / viewport.width) * 100;
@@ -102,9 +107,47 @@ async function zoomReset(page, durationMs = 600) {
   });
 }
 
-// Moves the fake cursor to the center of `selector` and waits for the glide
-// animation to finish, so the click/type that follows visibly lines up with
-// where the cursor just arrived.
+// Resolves `selector` to the first match that is BOTH:
+//   1. Playwright-visible (not display:none, not visibility:hidden, has a
+//      non-zero box) - catches most conditionally-hidden duplicate markup
+//      (e.g. a mobile-nav clone hidden until a hamburger menu opens).
+//   2. Actually positioned within the current viewport - catches the
+//      pattern Playwright's OWN visibility check does NOT catch: elements
+//      deliberately parked off-screen (e.g. accessibility "skip to
+//      content" links at `left: -9999px`, only repositioned on-screen via
+//      a :focus rule). These pass isVisible() but aren't really there.
+//
+// This is the single source of truth for "which element did the caller
+// actually mean" - click, type, search, zoomIn, and highlight all resolve
+// through this ONE function so they can never disagree about which of
+// several matches is the real one, and each only resolves the DOM once
+// per action instead of Playwright's own click()/fill() re-resolving the
+// selector a second time independently.
+//
+// Throws a clear, specific error (rather than a generic Playwright
+// timeout) when a selector matches elements that all turn out to be
+// hidden or off-screen - much easier to diagnose than "Timeout 15000ms
+// exceeded" with no indication of why.
+async function resolveVisibleElement(page, selector, timeoutMs = 15000) {
+  await page.waitForSelector(selector, { timeout: timeoutMs }); // throws if NOTHING matches at all
+  const viewport = page.viewportSize();
+  const candidates = await page.locator(selector).all();
+
+  for (const locator of candidates) {
+    if (!(await locator.isVisible())) continue;
+    const box = await locator.boundingBox();
+    if (!box) continue;
+    const inViewport = box.x + box.width > 0 && box.x < viewport.width && box.y + box.height > 0 && box.y < viewport.height;
+    if (inViewport) return { locator, box };
+  }
+
+  throw new Error(`Selector "${selector}" matched ${candidates.length} element(s), but none were visible and on-screen (all hidden, zero-size, or positioned outside the viewport)`);
+}
+
+// Moves the fake cursor to the center of `selector` (given an already-
+// resolved box - see resolveVisibleElement) and waits for the glide
+// animation to finish, so the click/type that follows visibly lines up
+// with where the cursor just arrived.
 //
 // Defensively re-runs cursorInitScript() via page.evaluate right before use
 // (it's idempotent - the early "already exists" check inside it makes this
@@ -113,11 +156,8 @@ async function zoomReset(page, durationMs = 600) {
 // or replacing the document in a way that doesn't cleanly re-fire it can
 // leave window.__abMoveCursorTo undefined - this guarantees it exists
 // regardless of why that happened.
-async function moveCursorToElement(page, selector, timeoutMs = 15000) {
-  const el = await page.waitForSelector(selector, { timeout: timeoutMs });
+async function moveCursorToBox(page, box) {
   await page.evaluate(cursorInitScript);
-  const box = await el.boundingBox();
-  if (!box) return; // element matched but isn't visible/laid out - nothing to point at
   const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   await page.evaluate(({ x, y }) => window.__abMoveCursorTo(x, y, false), center);
   await page.waitForTimeout(450); // let the glide animation actually play out on camera
@@ -208,38 +248,40 @@ async function runAction(page, action) {
       // painted" for every site (some content loads async after 'load'
       // too), which is why runRecordingJob also trims by measured duration
       // as a second layer of defense.
-      await page.goto(action.url, { waitUntil: action.waitUntil || 'load', timeout: action.timeoutMs || 30000 });
+      await page.goto(action.url, { waitUntil: action.waitUntil || 'load', timeout: action.timeoutMs ?? 30000 });
       break;
     }
 
     case 'wait': {
-      await page.waitForTimeout(action.ms || 1000);
+      await page.waitForTimeout(action.ms ?? 1000);
       break;
     }
 
     case 'waitForSelector': {
-      await page.waitForSelector(action.selector, { timeout: action.ms || 15000 });
+      await page.waitForSelector(action.selector, { timeout: action.ms ?? 15000 });
       break;
     }
 
     case 'click': {
+      const { locator, box } = await resolveVisibleElement(page, action.selector, action.timeoutMs);
       if (action.zoom) await zoomToElement(page, action.selector, action.zoom, action.zoomDurationMs);
-      await moveCursorToElement(page, action.selector, action.timeoutMs);
-      await page.click(action.selector, { timeout: action.timeoutMs || 15000 });
+      await moveCursorToBox(page, box);
+      await locator.click({ timeout: action.timeoutMs ?? 15000 });
       if (action.zoom && action.zoomOut !== false) {
-        await page.waitForTimeout(action.zoomHoldMs || 400); // brief hold on the clicked result before pulling back out
+        await page.waitForTimeout(action.zoomHoldMs ?? 400); // brief hold on the clicked result before pulling back out
         await zoomReset(page, action.zoomDurationMs);
       }
       break;
     }
 
     case 'type': {
+      const { locator, box } = await resolveVisibleElement(page, action.selector, action.timeoutMs);
       if (action.zoom) await zoomToElement(page, action.selector, action.zoom, action.zoomDurationMs);
-      await moveCursorToElement(page, action.selector, action.timeoutMs);
-      await page.fill(action.selector, ''); // clear first
-      await page.type(action.selector, action.text, { delay: action.delayMs || 30 });
+      await moveCursorToBox(page, box);
+      await locator.fill(''); // clear first
+      await locator.pressSequentially(action.text, { delay: action.delayMs ?? 30 });
       if (action.zoom && action.zoomOut !== false) {
-        await page.waitForTimeout(action.zoomHoldMs || 400);
+        await page.waitForTimeout(action.zoomHoldMs ?? 400);
         await zoomReset(page, action.zoomDurationMs);
       }
       break;
@@ -247,13 +289,14 @@ async function runAction(page, action) {
 
     case 'search': {
       const selector = action.selector || 'input[type="search"], input[name="s"], textarea[name="q"], input[name="q"]';
+      const { locator, box } = await resolveVisibleElement(page, selector);
       if (action.zoom) await zoomToElement(page, selector, action.zoom, action.zoomDurationMs);
-      await moveCursorToElement(page, selector);
-      await page.click(selector);
-      await page.type(selector, action.text, { delay: action.delayMs || 40 });
+      await moveCursorToBox(page, box);
+      await locator.click();
+      await locator.pressSequentially(action.text, { delay: action.delayMs ?? 40 });
       await page.keyboard.press('Enter');
       if (action.zoom && action.zoomOut !== false) {
-        await page.waitForTimeout(action.zoomHoldMs || 400);
+        await page.waitForTimeout(action.zoomHoldMs ?? 400);
         await zoomReset(page, action.zoomDurationMs);
       }
       break;
@@ -267,18 +310,18 @@ async function runAction(page, action) {
     // Standalone zoom control, for zooming on any area independent of a
     // click/search - e.g. to linger on a chart or a piece of text.
     case 'zoomIn': {
-      await zoomToElement(page, action.selector, action.scale || 1.5, action.durationMs || 600);
+      await zoomToElement(page, action.selector, action.scale ?? 1.5, action.durationMs ?? 600);
       break;
     }
 
     case 'zoomOut': {
-      await zoomReset(page, action.durationMs || 600);
+      await zoomReset(page, action.durationMs ?? 600);
       break;
     }
 
     case 'scroll': {
-      const pixels = action.pixels || 1000;
-      const durationMs = action.durationMs || 2000;
+      const pixels = action.pixels ?? 1000;
+      const durationMs = action.durationMs ?? 2000;
       const steps = Math.max(5, Math.floor(durationMs / 100));
       const stepSize = pixels / steps;
       const stepDelay = durationMs / steps;
@@ -295,28 +338,25 @@ async function runAction(page, action) {
     // clicked, rather than the click just silently happening off-screen.
     case 'highlight': {
       const color = action.color || '#ff3b30';
-      const durationMs = action.durationMs || 800;
-      const el = await page.waitForSelector(action.selector, { timeout: action.timeoutMs || 15000 });
-      const box = await el.boundingBox();
-      if (box) {
-        await page.evaluate(({ box, color }) => {
-          const div = document.createElement('div');
-          div.setAttribute('data-autobrowse-highlight', 'true');
-          Object.assign(div.style, {
-            position: 'fixed',
-            left: `${box.x - 4}px`,
-            top: `${box.y - 4}px`,
-            width: `${box.width + 8}px`,
-            height: `${box.height + 8}px`,
-            border: `3px solid ${color}`,
-            borderRadius: '6px',
-            boxShadow: `0 0 0 3px ${color}33`,
-            zIndex: 2147483647,
-            pointerEvents: 'none',
-          });
-          document.body.appendChild(div);
-        }, { box, color });
-      }
+      const durationMs = action.durationMs ?? 800;
+      const { box } = await resolveVisibleElement(page, action.selector, action.timeoutMs);
+      await page.evaluate(({ box, color }) => {
+        const div = document.createElement('div');
+        div.setAttribute('data-autobrowse-highlight', 'true');
+        Object.assign(div.style, {
+          position: 'fixed',
+          left: `${box.x - 4}px`,
+          top: `${box.y - 4}px`,
+          width: `${box.width + 8}px`,
+          height: `${box.height + 8}px`,
+          border: `3px solid ${color}`,
+          borderRadius: '6px',
+          boxShadow: `0 0 0 3px ${color}33`,
+          zIndex: 2147483647,
+          pointerEvents: 'none',
+        });
+        document.body.appendChild(div);
+      }, { box, color });
       await page.waitForTimeout(durationMs);
       await page.evaluate(() => {
         document.querySelectorAll('[data-autobrowse-highlight]').forEach((el) => el.remove());

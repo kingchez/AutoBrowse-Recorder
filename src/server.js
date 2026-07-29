@@ -18,14 +18,59 @@ fs.mkdirSync(JOBS_ROOT, { recursive: true });
 fs.mkdirSync(SESSIONS_ROOT, { recursive: true });
 
 function sessionPathFor(name) {
-  // Guard against path traversal via the session name.
-  const safe = String(name).replace(/[^a-zA-Z0-9_-]/g, '');
-  if (!safe) throw new Error('Invalid session name');
-  return path.join(SESSIONS_ROOT, `${safe}.json`);
+  // Reject (rather than silently strip) anything outside this safe set -
+  // stripping could make two different names collide on the same file
+  // (e.g. "a!b" and "ab" would both sanitize to "ab" and silently
+  // overwrite each other's saved session).
+  if (!/^[a-zA-Z0-9_-]+$/.test(String(name))) {
+    throw new Error('Session name must contain only letters, numbers, underscores, and hyphens');
+  }
+  return path.join(SESSIONS_ROOT, `${name}.json`);
 }
 
 function jobDirFor(id) {
   return path.join(JOBS_ROOT, id);
+}
+
+// Required fields per action type. Checked BEFORE launching a browser -
+// previously a typo'd action (e.g. `click` with no `selector`) wasn't
+// caught until deep into a job that had already spent 8+ seconds launching
+// Chromium and navigating, surfacing as a confusing Playwright-internal
+// error instead of an instant, clear 400.
+const REQUIRED_FIELDS_BY_TYPE = {
+  goto: ['url'],
+  wait: [],
+  waitForSelector: ['selector'],
+  click: ['selector'],
+  type: ['selector', 'text'],
+  search: ['text'], // selector is optional (falls back to common search-input selectors)
+  scroll: [],
+  pressKey: ['key'],
+  highlight: ['selector'],
+  screenshot: [],
+  zoomIn: ['selector'],
+  zoomOut: [],
+};
+
+function validateActions(actions) {
+  const errors = [];
+  actions.forEach((action, i) => {
+    if (!action || typeof action !== 'object') {
+      errors.push(`Action ${i + 1}: must be an object`);
+      return;
+    }
+    const requiredFields = REQUIRED_FIELDS_BY_TYPE[action.type];
+    if (requiredFields === undefined) {
+      errors.push(`Action ${i + 1}: unknown type "${action.type}"`);
+      return;
+    }
+    for (const field of requiredFields) {
+      if (action[field] === undefined || action[field] === null || action[field] === '') {
+        errors.push(`Action ${i + 1} (${action.type}): missing required field "${field}"`);
+      }
+    }
+  });
+  return errors;
 }
 
 // In-memory job registry: id -> { status, log, createdAt, outputPath?, screenshots?, error? }
@@ -50,22 +95,26 @@ function saveMeta(id) {
 
 // Webhook delivery, matching the render server's fireCallback exactly:
 // same payload shape ({ source, job_id, status, output_url?, error? }),
-// same 4-attempt / 2s-5s-15s backoff, same "only delete the in-memory job
-// record on a successful delivery" hygiene. `source` is "autobrowse" here
-// instead of "render" so the same n8n callback receiver can route on it.
+// same 4-attempt / 2s-5s-15s backoff.
 //
-// deleteOnSuccess defaults to true. It's set to false for the *interim*
-// error notification (see /record below) - that call reports the failure
-// immediately, before the partial video has finished encoding, so the job
-// record needs to stay alive for either a follow-up callback (once
-// output_url is ready) or a manual GET /recordings/:id/output pull.
+// IMPORTANT: a successful webhook POST means "the receiver was notified,"
+// NOT "the receiver already downloaded the file." Those are different
+// events - if this deleted the in-memory job record the instant the
+// webhook call returned 200, a receiver that fetches output_url even a
+// moment later would get a 404 on a file that's still sitting right there
+// on disk. So the job is only ever deleted here when the payload has NO
+// output_url at all (nothing will ever be fetchable for this job - e.g. a
+// hard failure with no video, or the interim "action just failed" notice
+// before encoding finishes). Whenever output_url IS present, deletion is
+// left entirely to GET /recordings/:id/output's own consume-on-delivery
+// logic (or the hourly prune, if it's never fetched).
 const CALLBACK_BACKOFF_MS = [2000, 5000, 15000];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fireCallback(callbackUrl, payload, { deleteOnSuccess = true } = {}) {
+async function fireCallback(callbackUrl, payload) {
   if (!callbackUrl) return;
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
@@ -76,7 +125,7 @@ async function fireCallback(callbackUrl, payload, { deleteOnSuccess = true } = {
       });
       if (res.ok) {
         console.log(`Callback to ${callbackUrl} delivered (job_id=${payload.job_id}, status=${payload.status}) on attempt ${attempt}.`);
-        if (deleteOnSuccess) jobs.delete(payload.job_id);
+        if (!payload.output_url) jobs.delete(payload.job_id); // nothing further will ever be fetchable
         return;
       }
       console.warn(`Callback to ${callbackUrl} returned HTTP ${res.status} on attempt ${attempt}.`);
@@ -86,6 +135,19 @@ async function fireCallback(callbackUrl, payload, { deleteOnSuccess = true } = {
     if (attempt < 4) await sleep(CALLBACK_BACKOFF_MS[attempt - 1]);
   }
   console.error(`Callback to ${callbackUrl} failed after 4 attempts (job_id=${payload.job_id}). Giving up - job record kept in memory for manual GET /recordings/${payload.job_id} pull.`);
+}
+
+// Defensive wrapper for every fire-and-forget fireCallback call below.
+// fireCallback already catches its own realistic failure modes internally,
+// so this should never actually trigger - but on Node 18+, an unhandled
+// promise rejection kills the entire process by default, meaning a single
+// unexpected bug in the callback path could take down every in-flight
+// recording, not just the one job reporting it. This guarantees that
+// can't happen regardless of what future changes touch fireCallback.
+function fireCallbackSafely(callbackUrl, payload) {
+  fireCallback(callbackUrl, payload).catch((err) => {
+    console.error(`Unexpected error in fireCallback (job_id=${payload.job_id}):`, err.message);
+  });
 }
 
 // Restart recovery, same idea as the render server: a job's real "done" time
@@ -141,6 +203,11 @@ app.post('/record', (req, res) => {
     return res.status(400).json({ error: 'Body must include a non-empty "actions" array' });
   }
 
+  const actionErrors = validateActions(actions);
+  if (actionErrors.length > 0) {
+    return res.status(400).json({ error: 'Invalid actions', details: actionErrors });
+  }
+
   let storageStatePath = null;
   if (session) {
     try {
@@ -173,15 +240,15 @@ app.post('/record', (req, res) => {
   // ffmpeg conversion of the partial video finishes. This is the fix for
   // errors being reported late: the failure is now signaled as fast as the
   // render server signals its own failures, even though - unlike the
-  // render server - a partial video may still show up moments later.
-  // deleteOnSuccess: false because the job isn't actually finished yet;
-  // a follow-up callback (or a manual GET) may still need this record.
+  // render server - a partial video may still show up moments later. No
+  // output_url in this payload yet, so fireCallback won't delete the job -
+  // it's still mid-encode.
   const onActionError = (message, failedAtIndex) => {
     job.status = 'error';
     job.error = message;
     job.failedAtIndex = failedAtIndex;
     saveMeta(jobId);
-    fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: message }, { deleteOnSuccess: false });
+    fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: message });
   };
 
   runRecordingJob({ actions, options, jobDir: dir, onLog, storageStatePath, onActionError })
@@ -195,11 +262,12 @@ app.post('/record', (req, res) => {
       const output_url = `${PUBLIC_BASE_URL}/recordings/${jobId}/output`;
       if (actionError) {
         // Follow-up to the instant error notice above - same status, now
-        // with the partial video actually ready to fetch. This one DOES
-        // clean up on success, since nothing further will ever arrive.
-        fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: actionError, output_url });
+        // with the partial video actually ready to fetch. The job stays in
+        // memory even after this delivers successfully, since output_url
+        // is present - actual cleanup happens once /output is fetched.
+        fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: actionError, output_url });
       } else {
-        fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'done', output_url });
+        fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'done', output_url });
       }
     })
     .catch((err) => {
@@ -210,7 +278,7 @@ app.post('/record', (req, res) => {
       job.error = err.message;
       onLog(`FATAL: ${err.message}`);
       saveMeta(jobId);
-      fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: err.message });
+      fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: err.message });
     });
 });
 

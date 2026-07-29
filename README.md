@@ -60,6 +60,16 @@ itself failed to launch), only the single immediate error call happens —
 there's nothing to follow up with. `GET /recordings/:id` remains a valid
 fallback at any point if a webhook delivery doesn't arrive.
 
+**On job cleanup timing:** a successfully delivered webhook means "the
+receiver was notified," not "the receiver already downloaded the file" —
+those are different events. The in-memory job record (and the file on
+disk) is only ever deleted once `output_url` has actually been fetched via
+`GET /recordings/:id/output` (or the job ages past `PRUNE_AFTER_HOURS`
+without being fetched at all). A webhook call that includes `output_url`
+never triggers deletion on its own, regardless of how many times it's
+delivered — so a slightly delayed fetch on the receiving end can never
+race against an early cleanup.
+
 **`options` fields (all optional):**
 - `orientation`: `"vertical"` or `"horizontal"`. Uses a real mobile
   (iPhone-equivalent UA, touch, 1080×1920) or desktop
@@ -94,6 +104,20 @@ anything but plain CSS, since they resolved elements via
 Playwright's own element handle + `boundingBox()` instead, which
 understands every selector engine correctly.)
 
+**On selector ambiguity (matches multiple elements):** if a selector
+matches several elements — very common on real sites with duplicated
+mobile-nav markup, accessibility skip-links, hidden clones, etc. —
+`click`, `type`, `search`, `highlight`, and `zoomIn` all resolve to the
+first match that is BOTH CSS-visible AND actually positioned within the
+current viewport, not just the first DOM match. This matters because
+Playwright's own visibility check does *not* catch elements deliberately
+parked off-screen (e.g. an accessibility "skip to content" link sitting at
+`left: -9999px`, only repositioned on focus) — those pass as "visible" by
+Playwright's own definition but aren't really there. If a selector matches
+only hidden/off-screen elements, the action fails immediately with a clear
+message naming the selector, rather than a generic 15-second timeout or
+(worse) silently succeeding on the wrong invisible element.
+
 **On the cursor:** Playwright's clicks are coordinate/DOM-based — there's
 no real OS mouse pointer to record. `click`, `type`, and `search` actions
 now animate a fake on-screen cursor (a small pointer icon) gliding to the
@@ -103,6 +127,17 @@ cursor script is re-injected defensively right before each use (not just
 relied on via `addInitScript`), so it stays working even if a page does an
 internal redirect or otherwise replaces the document in a way that skips
 the normal re-injection.
+
+**On zoom and sticky/fixed headers (known limitation):** `zoomIn` uses a
+CSS `transform: scale()` centered on the target element. CSS transforms
+create a new containing block for any `position: fixed` descendant (e.g.
+a sticky nav), so such elements can visibly shift or misplace during a
+zoom. This is a deliberate trade-off, not an oversight: the alternative
+(`zoom` instead of `transform`) doesn't have this side effect, but also
+doesn't support `transform-origin` at all — it can only ever scale from
+the page's top-left corner, which would break centered zooming on every
+single use rather than just on pages with sticky headers. Accurate
+centering was kept over avoiding this occasional glitch.
 
 **On the blank/white start:** the first `goto` action waits for the page's
 full `load` event (not just DOM-ready) before continuing, and the exact
@@ -126,6 +161,13 @@ detect content that's still visually settling after the `load` event fires
 load). If you're still seeing content pop in after the trim, the fix is a
 longer explicit `wait`, or better, a `waitForSelector` on an element that
 only appears once the page is genuinely done rendering.
+
+**On request validation:** `POST /record` checks every action has a known
+`type` and that type's required fields *before* launching a browser. A
+malformed request fails instantly with `{ error: "Invalid actions",
+details: [...] }` naming exactly which action and field is wrong, instead
+of wasting a full browser-launch-and-navigate cycle before failing with an
+opaque Playwright-internal error.
 
 **Supported action types:** `goto`, `wait`, `waitForSelector`, `click`,
 `type`, `search`, `scroll`, `pressKey`, `highlight`, `screenshot`,
