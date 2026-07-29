@@ -90,16 +90,34 @@ function cursorInitScript() {
 // wrong centering always).
 async function zoomToElement(page, box, scale = 1.5, durationMs = 600) {
   if (!box) return; // nothing resolved - nothing to zoom to
-  const viewport = page.viewportSize();
-  const originX = ((box.x + box.width / 2) / viewport.width) * 100;
-  const originY = ((box.y + box.height / 2) / viewport.height) * 100;
-  await page.evaluate(({ originX, originY, scale, durationMs }) => {
+
+  // `box` comes from getBoundingClientRect() (via Playwright's boundingBox()),
+  // which is VIEWPORT-relative. CSS `transform-origin` percentages, though,
+  // are relative to the transformed element's OWN border box - and since the
+  // transform is applied to document.documentElement (<html>), that box is
+  // sized to the full scrollable DOCUMENT, not the viewport. On any page
+  // taller than one screen (i.e. almost every real page), computing the
+  // origin as a percentage of viewport dimensions silently anchors the scale
+  // to the wrong point - which can shove the very element being zoomed to
+  // right off-screen, causing the click that follows to fail with "element
+  // is outside of the viewport" even though resolveVisibleElement just
+  // confirmed it was on-screen a moment earlier (before this ran).
+  //
+  // Pixel-based transform-origin sidesteps the ambiguity: it's the same
+  // unit regardless of which box it's relative to, as long as it's
+  // expressed in DOCUMENT coordinates - so the viewport-relative box needs
+  // the current scroll offset added back in.
+  const { scrollX, scrollY } = await page.evaluate(() => ({ scrollX: window.scrollX, scrollY: window.scrollY }));
+  const originXpx = scrollX + box.x + box.width / 2;
+  const originYpx = scrollY + box.y + box.height / 2;
+
+  await page.evaluate(({ originXpx, originYpx, scale, durationMs }) => {
     const html = document.documentElement;
     html.style.transition = `transform ${durationMs}ms ease-in-out`;
-    html.style.transformOrigin = `${originX}% ${originY}%`;
+    html.style.transformOrigin = `${originXpx}px ${originYpx}px`;
     html.style.transform = `scale(${scale})`;
     html.style.overflow = 'hidden'; // avoid scrollbars/edge artifacts while zoomed
-  }, { originX, originY, scale, durationMs });
+  }, { originXpx, originYpx, scale, durationMs });
   await page.waitForTimeout(durationMs);
 }
 
