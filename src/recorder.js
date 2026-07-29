@@ -56,6 +56,7 @@ function cursorInitScript() {
     const el = document.getElementById(CURSOR_ID);
     if (!el) return;
     el.style.transition = instant ? 'none' : 'transform 400ms cubic-bezier(0.22, 0.61, 0.36, 1)';
+    void el.offsetHeight; // force the transition to commit before the transform below changes it (see zoomToElement for why)
     el.style.transform = `translate(${x}px, ${y}px)`;
   };
 }
@@ -115,6 +116,15 @@ async function zoomToElement(page, box, scale = 1.5, durationMs = 600) {
     const html = document.documentElement;
     html.style.transition = `transform ${durationMs}ms ease-in-out`;
     html.style.transformOrigin = `${originXpx}px ${originYpx}px`;
+    // Force the browser to commit the style recalc for the lines above
+    // BEFORE the transform value below changes. Setting `transition` and
+    // then changing the property it applies to in the same synchronous
+    // block can get coalesced into a single style recalc by the browser -
+    // which skips the animation entirely and jumps straight to the end
+    // state instead of tweening through it (reads as an instant snap, not
+    // a smooth zoom). Reading a layout property forces a synchronous
+    // reflow, which commits everything queued so far as its own frame.
+    void html.offsetHeight;
     html.style.transform = `scale(${scale})`;
     html.style.overflow = 'hidden'; // avoid scrollbars/edge artifacts while zoomed
   }, { originXpx, originYpx, scale, durationMs });
@@ -133,6 +143,7 @@ async function zoomReset(page, durationMs = 600) {
     await page.evaluate((durationMs) => {
       const html = document.documentElement;
       html.style.transition = `transform ${durationMs}ms ease-in-out`;
+      void html.offsetHeight; // force the transition to commit before the transform below changes it
       html.style.transform = 'scale(1)';
     }, durationMs);
     await page.waitForTimeout(durationMs);
