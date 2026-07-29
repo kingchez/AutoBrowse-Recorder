@@ -68,6 +68,15 @@ before downsampling to the final video size. This is noticeably slower to
 encode than a faster preset; expect real encode time on top of the
 recording's own wall-clock duration.
 
+**On selectors:** `selector` fields throughout accept any Playwright
+selector engine — plain CSS, `text=...`, `role=...`, `xpath=...`, etc. —
+not just CSS. (Earlier versions of `highlight`, `zoomIn`/`zoomOut`, and
+the cursor-glide-to-target behavior on `click`/`type`/`search` broke on
+anything but plain CSS, since they resolved elements via
+`document.querySelector` under the hood. Fixed by resolving through
+Playwright's own element handle + `boundingBox()` instead, which
+understands every selector engine correctly.)
+
 **On the cursor:** Playwright's clicks are coordinate/DOM-based — there's
 no real OS mouse pointer to record. `click`, `type`, and `search` actions
 now animate a fake on-screen cursor (a small pointer icon) gliding to the

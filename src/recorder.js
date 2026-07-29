@@ -66,20 +66,26 @@ function cursorInitScript() {
 // geometry beyond what CSS transforms always do), and Playwright's own
 // click()/evaluate() hit-testing correctly accounts for the transform, so
 // clicking after a zoom still targets the right (now larger) element.
+//
+// Uses page.waitForSelector(...).boundingBox() rather than
+// document.querySelector inside page.evaluate - the latter only
+// understands plain CSS and breaks on Playwright's own extended selector
+// engines (text=, role=, xpath=, etc.), which are otherwise valid and
+// commonly used for `selector` throughout this file.
 async function zoomToElement(page, selector, scale = 1.5, durationMs = 600) {
-  await page.waitForSelector(selector, { timeout: 15000 });
-  await page.evaluate(({ selector, scale, durationMs }) => {
-    const el = document.querySelector(selector);
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const originX = ((rect.left + rect.width / 2) / window.innerWidth) * 100;
-    const originY = ((rect.top + rect.height / 2) / window.innerHeight) * 100;
+  const el = await page.waitForSelector(selector, { timeout: 15000 });
+  const box = await el.boundingBox();
+  if (!box) return; // element matched but isn't visible/laid out - nothing to zoom to
+  const viewport = page.viewportSize();
+  const originX = ((box.x + box.width / 2) / viewport.width) * 100;
+  const originY = ((box.y + box.height / 2) / viewport.height) * 100;
+  await page.evaluate(({ originX, originY, scale, durationMs }) => {
     const html = document.documentElement;
     html.style.transition = `transform ${durationMs}ms ease-in-out`;
     html.style.transformOrigin = `${originX}% ${originY}%`;
     html.style.transform = `scale(${scale})`;
     html.style.overflow = 'hidden'; // avoid scrollbars/edge artifacts while zoomed
-  }, { selector, scale, durationMs });
+  }, { originX, originY, scale, durationMs });
   await page.waitForTimeout(durationMs);
 }
 
@@ -108,15 +114,11 @@ async function zoomReset(page, durationMs = 600) {
 // leave window.__abMoveCursorTo undefined - this guarantees it exists
 // regardless of why that happened.
 async function moveCursorToElement(page, selector, timeoutMs = 15000) {
-  await page.waitForSelector(selector, { timeout: timeoutMs });
+  const el = await page.waitForSelector(selector, { timeout: timeoutMs });
   await page.evaluate(cursorInitScript);
-  const center = await page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  }, selector);
-  if (!center) return;
+  const box = await el.boundingBox();
+  if (!box) return; // element matched but isn't visible/laid out - nothing to point at
+  const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   await page.evaluate(({ x, y }) => window.__abMoveCursorTo(x, y, false), center);
   await page.waitForTimeout(450); // let the glide animation actually play out on camera
 }
@@ -294,27 +296,27 @@ async function runAction(page, action) {
     case 'highlight': {
       const color = action.color || '#ff3b30';
       const durationMs = action.durationMs || 800;
-      await page.waitForSelector(action.selector, { timeout: action.timeoutMs || 15000 });
-      await page.evaluate(({ selector, color }) => {
-        const el = document.querySelector(selector);
-        if (!el) return;
-        const rect = el.getBoundingClientRect();
-        const box = document.createElement('div');
-        box.setAttribute('data-autobrowse-highlight', 'true');
-        Object.assign(box.style, {
-          position: 'fixed',
-          left: `${rect.left - 4}px`,
-          top: `${rect.top - 4}px`,
-          width: `${rect.width + 8}px`,
-          height: `${rect.height + 8}px`,
-          border: `3px solid ${color}`,
-          borderRadius: '6px',
-          boxShadow: `0 0 0 3px ${color}33`,
-          zIndex: 2147483647,
-          pointerEvents: 'none',
-        });
-        document.body.appendChild(box);
-      }, { selector: action.selector, color });
+      const el = await page.waitForSelector(action.selector, { timeout: action.timeoutMs || 15000 });
+      const box = await el.boundingBox();
+      if (box) {
+        await page.evaluate(({ box, color }) => {
+          const div = document.createElement('div');
+          div.setAttribute('data-autobrowse-highlight', 'true');
+          Object.assign(div.style, {
+            position: 'fixed',
+            left: `${box.x - 4}px`,
+            top: `${box.y - 4}px`,
+            width: `${box.width + 8}px`,
+            height: `${box.height + 8}px`,
+            border: `3px solid ${color}`,
+            borderRadius: '6px',
+            boxShadow: `0 0 0 3px ${color}33`,
+            zIndex: 2147483647,
+            pointerEvents: 'none',
+          });
+          document.body.appendChild(div);
+        }, { box, color });
+      }
       await page.waitForTimeout(durationMs);
       await page.evaluate(() => {
         document.querySelectorAll('[data-autobrowse-highlight]').forEach((el) => el.remove());
