@@ -106,17 +106,19 @@ understands every selector engine correctly.)
 
 **On selector ambiguity (matches multiple elements):** if a selector
 matches several elements — very common on real sites with duplicated
-mobile-nav markup, accessibility skip-links, hidden clones, etc. —
-`click`, `type`, `search`, `highlight`, and `zoomIn` all resolve to the
-first match that is BOTH CSS-visible AND actually positioned within the
-current viewport, not just the first DOM match. This matters because
-Playwright's own visibility check does *not* catch elements deliberately
-parked off-screen (e.g. an accessibility "skip to content" link sitting at
-`left: -9999px`, only repositioned on focus) — those pass as "visible" by
-Playwright's own definition but aren't really there. If a selector matches
-only hidden/off-screen elements, the action fails immediately with a clear
-message naming the selector, rather than a generic 15-second timeout or
-(worse) silently succeeding on the wrong invisible element.
+mobile-nav markup, accessibility skip-links, off-canvas menu clones,
+etc. — `click`, `type`, `search`, `highlight`, and `zoomIn` all resolve to
+the first match that passes Playwright's own actionability checks
+(visible, stable, enabled, not obscured or clipped by a parent), tried
+against each match in turn with a fast per-candidate probe, rather than
+just committing to the first DOM match. An earlier version of this tried
+to approximate "is this really on-screen" with its own bounding-box-vs-
+viewport math; that wasn't reliable enough (it doesn't understand things
+like an off-canvas panel sitting inside an `overflow: hidden` ancestor),
+so it was replaced with Playwright's real actionability engine directly.
+If every match fails that check, the action fails immediately with a
+clear message naming the selector, rather than a generic 15-second
+timeout or (worse) silently succeeding on the wrong invisible element.
 
 **On the cursor:** Playwright's clicks are coordinate/DOM-based — there's
 no real OS mouse pointer to record. `click`, `type`, and `search` actions

@@ -107,15 +107,22 @@ async function zoomReset(page, durationMs = 600) {
   });
 }
 
-// Resolves `selector` to the first match that is BOTH:
-//   1. Playwright-visible (not display:none, not visibility:hidden, has a
-//      non-zero box) - catches most conditionally-hidden duplicate markup
-//      (e.g. a mobile-nav clone hidden until a hamburger menu opens).
-//   2. Actually positioned within the current viewport - catches the
-//      pattern Playwright's OWN visibility check does NOT catch: elements
-//      deliberately parked off-screen (e.g. accessibility "skip to
-//      content" links at `left: -9999px`, only repositioned on-screen via
-//      a :focus rule). These pass isVisible() but aren't really there.
+// Resolves `selector` to the first match that Playwright's OWN
+// actionability engine considers genuinely clickable - visible, stable,
+// enabled, and not obscured or clipped by an ancestor.
+//
+// An earlier version of this function tried to reimplement "is this
+// really on-screen" by comparing boundingBox() coordinates against the
+// viewport dimensions directly. That's not good enough: it doesn't
+// account for things like an off-canvas mobile-menu panel sitting inside
+// an `overflow: hidden` ancestor, or a parent `transform: translateX(...)`
+// pushing content out of view while the element's OWN box coordinates
+// still look nominally on-screen. Playwright's real actionability checks
+// already handle all of this correctly (proven by its own error logs
+// literally saying "element is outside of the viewport" for exactly the
+// element this used to wrongly accept) - so this now uses that engine
+// directly via `{ trial: true }`, which runs every actionability check a
+// real click would but stops short of actually performing it.
 //
 // This is the single source of truth for "which element did the caller
 // actually mean" - click, type, search, zoomIn, and highlight all resolve
@@ -123,25 +130,27 @@ async function zoomReset(page, durationMs = 600) {
 // several matches is the real one, and each only resolves the DOM once
 // per action instead of Playwright's own click()/fill() re-resolving the
 // selector a second time independently.
-//
-// Throws a clear, specific error (rather than a generic Playwright
-// timeout) when a selector matches elements that all turn out to be
-// hidden or off-screen - much easier to diagnose than "Timeout 15000ms
-// exceeded" with no indication of why.
 async function resolveVisibleElement(page, selector, timeoutMs = 15000) {
   await page.waitForSelector(selector, { timeout: timeoutMs }); // throws if NOTHING matches at all
-  const viewport = page.viewportSize();
   const candidates = await page.locator(selector).all();
 
+  // Short fast-fail probe per candidate (not a slice of timeoutMs) - a
+  // genuinely actionable element passes almost instantly, and a bad one
+  // should be ruled out quickly rather than eating a large chunk of the
+  // overall budget before moving to the next candidate.
+  const PROBE_TIMEOUT_MS = 1500;
+
   for (const locator of candidates) {
-    if (!(await locator.isVisible())) continue;
-    const box = await locator.boundingBox();
-    if (!box) continue;
-    const inViewport = box.x + box.width > 0 && box.x < viewport.width && box.y + box.height > 0 && box.y < viewport.height;
-    if (inViewport) return { locator, box };
+    try {
+      await locator.click({ trial: true, timeout: PROBE_TIMEOUT_MS });
+      const box = await locator.boundingBox();
+      if (box) return { locator, box };
+    } catch (_) {
+      continue; // this candidate failed Playwright's own actionability check - try the next one
+    }
   }
 
-  throw new Error(`Selector "${selector}" matched ${candidates.length} element(s), but none were visible and on-screen (all hidden, zero-size, or positioned outside the viewport)`);
+  throw new Error(`Selector "${selector}" matched ${candidates.length} element(s), but none passed Playwright's actionability check (all hidden, off-screen, clipped by a parent, or obscured)`);
 }
 
 // Moves the fake cursor to the center of `selector` (given an already-
