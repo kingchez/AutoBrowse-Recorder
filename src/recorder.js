@@ -122,16 +122,44 @@ async function zoomToElement(page, box, scale = 1.5, durationMs = 600) {
 }
 
 // Reverses zoomToElement back to scale(1), same transition duration.
+//
+// Defensively tolerates the page having navigated out from under it (see
+// settleAfterPossibleNavigation below for the normal case this guards
+// against) - if the execution context is gone, there's nothing to reset:
+// whatever new page just loaded doesn't have this zoom transform applied
+// in the first place, so the "reset" is trivially already true.
 async function zoomReset(page, durationMs = 600) {
-  await page.evaluate((durationMs) => {
-    const html = document.documentElement;
-    html.style.transition = `transform ${durationMs}ms ease-in-out`;
-    html.style.transform = 'scale(1)';
-  }, durationMs);
-  await page.waitForTimeout(durationMs);
-  await page.evaluate(() => {
-    document.documentElement.style.overflow = '';
-  });
+  try {
+    await page.evaluate((durationMs) => {
+      const html = document.documentElement;
+      html.style.transition = `transform ${durationMs}ms ease-in-out`;
+      html.style.transform = 'scale(1)';
+    }, durationMs);
+    await page.waitForTimeout(durationMs);
+    await page.evaluate(() => {
+      document.documentElement.style.overflow = '';
+    });
+  } catch (err) {
+    if (!/Execution context was destroyed|Target (page|closed|crashed)|has been closed/i.test(err.message)) throw err;
+  }
+}
+
+// Click and search (via Enter) can both legitimately trigger a full page
+// navigation - a link, a submit button, a search box. When that happens,
+// the OLD page's execution context is torn down, and anything that runs
+// next (the caller's own zoom-out step, or worse, the NEXT action in the
+// list resolving a selector on what it assumes is still the same page)
+// hits a confusing "Execution context was destroyed" error - even though
+// the navigation itself was the intended, correct outcome of the action.
+//
+// This gives a just-triggered navigation a bounded window to finish before
+// control returns to the caller. It's a genuine no-op when nothing
+// navigated: page.waitForLoadState() resolves immediately if the page is
+// already in (or past) the requested state, which is normal for actions
+// that don't cause a page change (e.g. an in-place UI toggle, a same-page
+// anchor click, an AJAX/SPA-style search that never does a full reload).
+async function settleAfterPossibleNavigation(page, timeoutMs = 10000) {
+  await page.waitForLoadState('load', { timeout: timeoutMs }).catch(() => {});
 }
 
 // Thin wrapper for the standalone `zoomIn` action, which (unlike click/
@@ -350,6 +378,7 @@ async function runAction(page, action) {
       // genuinely broken action from silently eating 30s (15s resolve +
       // 15s click) before the job gives up.
       await locator.click({ timeout: action.timeoutMs ?? 5000 });
+      await settleAfterPossibleNavigation(page);
       if (action.zoom && action.zoomOut !== false) {
         await page.waitForTimeout(action.zoomHoldMs ?? 400); // brief hold on the clicked result before pulling back out
         await zoomReset(page, action.zoomDurationMs);
@@ -378,6 +407,7 @@ async function runAction(page, action) {
       await locator.click();
       await locator.pressSequentially(action.text, { delay: action.delayMs ?? 40 });
       await page.keyboard.press('Enter');
+      await settleAfterPossibleNavigation(page);
       if (action.zoom && action.zoomOut !== false) {
         await page.waitForTimeout(action.zoomHoldMs ?? 400);
         await zoomReset(page, action.zoomDurationMs);
