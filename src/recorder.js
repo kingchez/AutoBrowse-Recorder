@@ -360,8 +360,17 @@ async function runAction(page, action) {
  *   options.deviceScaleFactor: override pixel density (2 = retina; higher = sharper but heavier)
  *
  * onLog(line) is called with progress strings for storage in job metadata.
+ * onActionError(message, failedAtIndex) is called THE MOMENT an action
+ * fails - before the (potentially slow, "slow"/crf16) ffmpeg conversion of
+ * the partial video even starts. This is what lets the caller report an
+ * error immediately instead of waiting for encoding to finish first, same
+ * as the render server's fail-fast philosophy - the difference here is
+ * that AutoBrowse can still recover a partial video afterward, so instead
+ * of also throwing everything away, encoding still proceeds in the
+ * background and the caller can send a follow-up update once
+ * outputPath is ready.
  */
-async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}, storageStatePath = null }) {
+async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}, storageStatePath = null, onActionError = () => {} }) {
   const deviceProfile = resolveDeviceProfile(options);
 
   fs.mkdirSync(jobDir, { recursive: true });
@@ -419,6 +428,7 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
       actionError = err.message;
       failedAtIndex = i;
       onLog(`Action ${i + 1} FAILED: ${err.message} - stopping here, finalizing partial recording`);
+      onActionError(err.message, i); // fire immediately - don't wait for the conversion below
       break; // stop executing further actions, but still fall through to finalize below
     }
   }

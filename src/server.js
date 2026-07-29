@@ -48,6 +48,46 @@ function saveMeta(id) {
   fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(job, null, 2));
 }
 
+// Webhook delivery, matching the render server's fireCallback exactly:
+// same payload shape ({ source, job_id, status, output_url?, error? }),
+// same 4-attempt / 2s-5s-15s backoff, same "only delete the in-memory job
+// record on a successful delivery" hygiene. `source` is "autobrowse" here
+// instead of "render" so the same n8n callback receiver can route on it.
+//
+// deleteOnSuccess defaults to true. It's set to false for the *interim*
+// error notification (see /record below) - that call reports the failure
+// immediately, before the partial video has finished encoding, so the job
+// record needs to stay alive for either a follow-up callback (once
+// output_url is ready) or a manual GET /recordings/:id/output pull.
+const CALLBACK_BACKOFF_MS = [2000, 5000, 15000];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fireCallback(callbackUrl, payload, { deleteOnSuccess = true } = {}) {
+  if (!callbackUrl) return;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(callbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        console.log(`Callback to ${callbackUrl} delivered (job_id=${payload.job_id}, status=${payload.status}) on attempt ${attempt}.`);
+        if (deleteOnSuccess) jobs.delete(payload.job_id);
+        return;
+      }
+      console.warn(`Callback to ${callbackUrl} returned HTTP ${res.status} on attempt ${attempt}.`);
+    } catch (err) {
+      console.warn(`Callback to ${callbackUrl} failed on attempt ${attempt}:`, err.message);
+    }
+    if (attempt < 4) await sleep(CALLBACK_BACKOFF_MS[attempt - 1]);
+  }
+  console.error(`Callback to ${callbackUrl} failed after 4 attempts (job_id=${payload.job_id}). Giving up - job record kept in memory for manual GET /recordings/${payload.job_id} pull.`);
+}
+
 // Restart recovery, same idea as the render server: a job's real "done" time
 // is its own output.mp4 mtime, not anything we tracked in memory (which is
 // gone after a restart). For each job directory on disk:
@@ -92,10 +132,10 @@ function recoverJobsFromDisk() {
 }
 recoverJobsFromDisk();
 
-// POST /record  { actions: [...], options?: { width, height }, session?: "name" }
+// POST /record  { actions: [...], options?: {...}, session?: "name", callbackUrl?: "..." }
 // Returns immediately with a job id; recording happens async since it's wall-clock bound.
 app.post('/record', (req, res) => {
-  const { actions, options, session } = req.body || {};
+  const { actions, options, session, callbackUrl } = req.body || {};
 
   if (!Array.isArray(actions) || actions.length === 0) {
     return res.status(400).json({ error: 'Body must include a non-empty "actions" array' });
@@ -129,21 +169,48 @@ app.post('/record', (req, res) => {
     saveMeta(jobId);
   };
 
-  runRecordingJob({ actions, options, jobDir: dir, onLog, storageStatePath })
+  // Fires the moment an action fails - NOT after the (potentially slow)
+  // ffmpeg conversion of the partial video finishes. This is the fix for
+  // errors being reported late: the failure is now signaled as fast as the
+  // render server signals its own failures, even though - unlike the
+  // render server - a partial video may still show up moments later.
+  // deleteOnSuccess: false because the job isn't actually finished yet;
+  // a follow-up callback (or a manual GET) may still need this record.
+  const onActionError = (message, failedAtIndex) => {
+    job.status = 'error';
+    job.error = message;
+    job.failedAtIndex = failedAtIndex;
+    saveMeta(jobId);
+    fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: message }, { deleteOnSuccess: false });
+  };
+
+  runRecordingJob({ actions, options, jobDir: dir, onLog, storageStatePath, onActionError })
     .then(({ outputPath, screenshots, actionError }) => {
       job.status = actionError ? 'error' : 'done';
       job.outputPath = outputPath;
       job.screenshots = screenshots;
       if (actionError) job.error = actionError;
       saveMeta(jobId);
+
+      const output_url = `${PUBLIC_BASE_URL}/recordings/${jobId}/output`;
+      if (actionError) {
+        // Follow-up to the instant error notice above - same status, now
+        // with the partial video actually ready to fetch. This one DOES
+        // clean up on success, since nothing further will ever arrive.
+        fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: actionError, output_url });
+      } else {
+        fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'done', output_url });
+      }
     })
     .catch((err) => {
       // A hard failure with no usable video at all (e.g. Chromium itself
-      // never launched) - nothing to deliver, so clean up immediately.
+      // never launched) - nothing to deliver, ever. Single callback, no
+      // output_url, delete on success (nothing more is coming).
       job.status = 'error';
       job.error = err.message;
       onLog(`FATAL: ${err.message}`);
       saveMeta(jobId);
+      fireCallback(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: err.message });
     });
 });
 

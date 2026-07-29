@@ -17,9 +17,10 @@ poll for status, then fetch the finished file.
 3. Once actions finish, the context closes (finalizing the `.webm`), then
    FFmpeg converts it to `.mp4`.
 4. Poll `GET /recordings/:id` for status, then `GET /recordings/:id/output`
-   to stream the MP4. **The file is deleted after successful delivery**
-   (consume-on-delivery), and undelivered jobs are pruned after
-   `PRUNE_AFTER_HOURS` (default 48).
+   to stream the MP4 — **or** pass a `callbackUrl` (see below) to get
+   pushed a webhook instead of polling.  **The file is deleted after
+   successful delivery** (consume-on-delivery), and undelivered jobs are
+   pruned after `PRUNE_AFTER_HOURS` (default 48).
 
 ## API
 
@@ -37,11 +38,27 @@ poll for status, then fetch the finished file.
     "orientation": "vertical",
     "deviceScaleFactor": 2
   },
-  "session": "optional-saved-session-name"
+  "session": "optional-saved-session-name",
+  "callbackUrl": "optional-webhook-url"
 }
 ```
 
 Returns `202 { jobId, status }`.
+
+**Webhook delivery (`callbackUrl`):** if provided, posts JSON to that URL
+instead of requiring polling: `{ source: "autobrowse", job_id, status,
+output_url?, error? }`. 4 delivery attempts with 2s/5s/15s backoff. On
+success (`status: "done"`), one call, with `output_url`. On a mid-job
+action failure, **two** calls: the first fires the instant the action
+fails — before the partial video has even finished encoding — with
+`status: "error"` and no `output_url` yet, so the failure is reported as
+fast as possible rather than waiting on ffmpeg. A second call follows once
+the partial video finishes encoding, same `status: "error"`, now with
+`output_url` populated so you can still fetch the partial recording if you
+want it. On a hard failure with no video ever produced (e.g. Chromium
+itself failed to launch), only the single immediate error call happens —
+there's nothing to follow up with. `GET /recordings/:id` remains a valid
+fallback at any point if a webhook delivery doesn't arrive.
 
 **`options` fields (all optional):**
 - `orientation`: `"vertical"` or `"horizontal"`. Uses a real mobile
