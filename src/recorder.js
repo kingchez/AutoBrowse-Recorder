@@ -60,12 +60,22 @@ function cursorInitScript() {
   };
 }
 
-// Zooms the whole page in on `selector` by applying a CSS scale transform
-// with its origin centered on that element - like a camera push-in. This
-// affects layout visually only (the transform doesn't change actual DOM
-// geometry beyond what CSS transforms always do), and Playwright's own
-// click()/evaluate() hit-testing correctly accounts for the transform, so
-// clicking after a zoom still targets the right (now larger) element.
+// Zooms the whole page in on an already-resolved element `box` by applying
+// a CSS scale transform with its origin centered on that element - like a
+// camera push-in. This affects layout visually only (the transform doesn't
+// change actual DOM geometry beyond what CSS transforms always do), and
+// Playwright's own click()/evaluate() hit-testing correctly accounts for
+// the transform, so clicking after a zoom still targets the right (now
+// larger) element.
+//
+// Takes a `box` (from resolveVisibleElement) rather than a selector: click/
+// type/search have already resolved their target once and pass that same
+// box straight through, so the DOM is only ever queried once per action.
+// Re-resolving the selector a second time here used to make it possible for
+// the same selector to answer differently across the two calls (e.g. a
+// hover-triggered menu changing the DOM between the first resolution and
+// this one), which could zoom in on the wrong element than the one about
+// to be clicked/typed into.
 //
 // KNOWN LIMITATION: CSS `transform` on an ancestor creates a new
 // containing block for any `position: fixed` descendant (e.g. a sticky
@@ -78,9 +88,8 @@ function cursorInitScript() {
 // trade-off, this keeps `transform: scale` (accurate centered zoom,
 // occasional sticky-header glitch) over `zoom` (correct on sticky headers,
 // wrong centering always).
-async function zoomToElement(page, selector, scale = 1.5, durationMs = 600) {
-  const { box } = await resolveVisibleElement(page, selector);
-  if (!box) return; // element matched but isn't visible/laid out - nothing to zoom to
+async function zoomToElement(page, box, scale = 1.5, durationMs = 600) {
+  if (!box) return; // nothing resolved - nothing to zoom to
   const viewport = page.viewportSize();
   const originX = ((box.x + box.width / 2) / viewport.width) * 100;
   const originY = ((box.y + box.height / 2) / viewport.height) * 100;
@@ -105,6 +114,14 @@ async function zoomReset(page, durationMs = 600) {
   await page.evaluate(() => {
     document.documentElement.style.overflow = '';
   });
+}
+
+// Thin wrapper for the standalone `zoomIn` action, which (unlike click/
+// type/search) has no already-resolved box to hand zoomToElement - it has
+// to resolve the selector itself first.
+async function zoomToSelector(page, selector, scale = 1.5, durationMs = 600) {
+  const { box } = await resolveVisibleElement(page, selector);
+  await zoomToElement(page, box, scale, durationMs);
 }
 
 // Resolves `selector` to the first match that Playwright's OWN
@@ -140,17 +157,51 @@ async function resolveVisibleElement(page, selector, timeoutMs = 15000) {
   // overall budget before moving to the next candidate.
   const PROBE_TIMEOUT_MS = 1500;
 
+  let lastError = null;
+
   for (const locator of candidates) {
     try {
+      // `trial: true` only checks visible/stable/enabled/receives-events AT
+      // THE ELEMENT'S CURRENT POSITION - it does NOT guarantee the element
+      // is actually inside the current viewport. An element sitting inside
+      // an off-canvas panel (e.g. a slide-in mobile menu hidden via
+      // `transform: translateX(...)` rather than display:none) can pass
+      // this trial cleanly and then hang for the caller's full click
+      // timeout later, retrying scrollIntoViewIfNeeded forever on something
+      // no scroll can ever bring on-screen. So: explicitly scroll it into
+      // view and re-check its box against the real viewport dimensions
+      // before trusting this candidate - if it's still off-canvas after
+      // that, treat it as a failed candidate and move on, exactly like any
+      // other actionability failure.
       await locator.click({ trial: true, timeout: PROBE_TIMEOUT_MS });
+      await locator.scrollIntoViewIfNeeded({ timeout: PROBE_TIMEOUT_MS });
       const box = await locator.boundingBox();
-      if (box) return { locator, box };
-    } catch (_) {
-      continue; // this candidate failed Playwright's own actionability check - try the next one
+      if (!box) continue;
+
+      const viewport = page.viewportSize();
+      const fitsViewport = box.x >= -1 && box.y >= -1 &&
+        box.x + box.width <= viewport.width + 1 &&
+        box.y + box.height <= viewport.height + 1;
+      if (!fitsViewport) {
+        lastError = new Error(`matched element's box (${Math.round(box.x)},${Math.round(box.y)} ${Math.round(box.width)}x${Math.round(box.height)}) falls outside the ${viewport.width}x${viewport.height} viewport - likely an off-canvas/hidden-menu clone`);
+        continue;
+      }
+
+      return { locator, box };
+    } catch (err) {
+      // A closed page/context isn't "this candidate wasn't actionable" -
+      // it's the browser going away mid-check (crash, unexpected
+      // navigation away, external context.close()). No other candidate is
+      // going to fare any better, and swallowing this into the generic
+      // "none passed" message below would hide the actual cause.
+      if (/has been closed|Target (page|closed|crashed)/i.test(err.message)) throw err;
+      lastError = err; // this candidate failed Playwright's own actionability check - try the next one
+      continue;
     }
   }
 
-  throw new Error(`Selector "${selector}" matched ${candidates.length} element(s), but none passed Playwright's actionability check (all hidden, off-screen, clipped by a parent, or obscured)`);
+  const detail = lastError ? ` Last candidate failure: ${String(lastError.message).split('\n')[0]}` : '';
+  throw new Error(`Selector "${selector}" matched ${candidates.length} element(s), but none passed Playwright's actionability + viewport check (all hidden, off-screen, clipped by a parent, or obscured).${detail}`);
 }
 
 // Moves the fake cursor to the center of `selector` (given an already-
@@ -273,9 +324,14 @@ async function runAction(page, action) {
 
     case 'click': {
       const { locator, box } = await resolveVisibleElement(page, action.selector, action.timeoutMs);
-      if (action.zoom) await zoomToElement(page, action.selector, action.zoom, action.zoomDurationMs);
+      if (action.zoom) await zoomToElement(page, box, action.zoom, action.zoomDurationMs);
       await moveCursorToBox(page, box);
-      await locator.click({ timeout: action.timeoutMs ?? 15000 });
+      // resolveVisibleElement already ran a trial + scroll + viewport check
+      // for this exact locator, so a short timeout here is just a safety
+      // margin for the real click - not another full wait budget. Keeps a
+      // genuinely broken action from silently eating 30s (15s resolve +
+      // 15s click) before the job gives up.
+      await locator.click({ timeout: action.timeoutMs ?? 5000 });
       if (action.zoom && action.zoomOut !== false) {
         await page.waitForTimeout(action.zoomHoldMs ?? 400); // brief hold on the clicked result before pulling back out
         await zoomReset(page, action.zoomDurationMs);
@@ -285,7 +341,7 @@ async function runAction(page, action) {
 
     case 'type': {
       const { locator, box } = await resolveVisibleElement(page, action.selector, action.timeoutMs);
-      if (action.zoom) await zoomToElement(page, action.selector, action.zoom, action.zoomDurationMs);
+      if (action.zoom) await zoomToElement(page, box, action.zoom, action.zoomDurationMs);
       await moveCursorToBox(page, box);
       await locator.fill(''); // clear first
       await locator.pressSequentially(action.text, { delay: action.delayMs ?? 30 });
@@ -299,7 +355,7 @@ async function runAction(page, action) {
     case 'search': {
       const selector = action.selector || 'input[type="search"], input[name="s"], textarea[name="q"], input[name="q"]';
       const { locator, box } = await resolveVisibleElement(page, selector);
-      if (action.zoom) await zoomToElement(page, selector, action.zoom, action.zoomDurationMs);
+      if (action.zoom) await zoomToElement(page, box, action.zoom, action.zoomDurationMs);
       await moveCursorToBox(page, box);
       await locator.click();
       await locator.pressSequentially(action.text, { delay: action.delayMs ?? 40 });
@@ -319,7 +375,7 @@ async function runAction(page, action) {
     // Standalone zoom control, for zooming on any area independent of a
     // click/search - e.g. to linger on a chart or a piece of text.
     case 'zoomIn': {
-      await zoomToElement(page, action.selector, action.scale ?? 1.5, action.durationMs ?? 600);
+      await zoomToSelector(page, action.selector, action.scale ?? 1.5, action.durationMs ?? 600);
       break;
     }
 
