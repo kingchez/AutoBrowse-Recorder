@@ -2,7 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
-const { runRecordingJob, createSession } = require('./recorder');
+const { runRecordingJob, createSession, inspectPage } = require('./recorder');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -280,6 +280,42 @@ app.post('/record', (req, res) => {
       saveMeta(jobId);
       fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: err.message });
     });
+});
+
+// POST /inspect  { url: "...", options?: {...}, session?: "name" }
+// Synchronous (no job id, no polling) - navigates once, returns a pruned
+// list of the page's actual interactive elements (links/buttons/inputs/
+// images with alt text) so an action-planning step can generate selectors
+// grounded in the real DOM instead of guessing. Meant to run as a step
+// BEFORE building the actions array for POST /record, not during it -
+// call this once per page you're about to plan for, feed the result to
+// whatever generates your actions JSON, then call /record with the
+// selectors it comes back with.
+app.post('/inspect', async (req, res) => {
+  const { url, options, session, maxElementsPerType } = req.body || {};
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'Body must include a "url" string' });
+  }
+
+  let storageStatePath = null;
+  if (session) {
+    try {
+      storageStatePath = sessionPathFor(session);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (!fs.existsSync(storageStatePath)) {
+      return res.status(404).json({ error: `No saved session named "${session}". Create it first via POST /sessions.` });
+    }
+  }
+
+  try {
+    const result = await inspectPage({ url, options, storageStatePath, maxElementsPerType });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /recordings/:id -> status + log + output_url (once something is deliverable)

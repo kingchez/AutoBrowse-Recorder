@@ -653,6 +653,100 @@ function convertToMp4(inputPath, outputPath, trimSeconds = 0) {
   });
 }
 
+// Extracts a pruned, planner-friendly summary of a page's interactive
+// elements - links (text + href), buttons, inputs, and images (alt text) -
+// so an action-planning LLM can generate selectors grounded in the page's
+// ACTUAL rendered DOM instead of guessing from the page's name/URL/general
+// knowledge of what a site like this "probably" looks like. Same fix in
+// spirit as feeding a scene planner a live clone of available components
+// instead of letting it guess from memory: ground the planner in reality
+// BEFORE it plans, not after a selector fails.
+//
+// Deliberately does NOT return raw HTML: a full page's markup is far more
+// tokens than a planner needs, and buries the handful of elements that
+// actually matter (interactive ones) inside thousands of layout/decorative
+// nodes. A flat, pre-filtered, de-duplicated list keeps the planner's
+// prompt small and focused on exactly what it can act on.
+//
+// Runs through the same stealth-launched browser as recording jobs (same
+// UA/viewport handling via resolveDeviceProfile) and accepts the same
+// storageStatePath as runRecordingJob, so a saved session (POST
+// /sessions) works identically here - inspecting a page that requires
+// sign-in sees the same authenticated DOM the actual recording job would.
+async function inspectPage({ url, options = {}, storageStatePath = null, maxElementsPerType = 60 }) {
+  const deviceProfile = resolveDeviceProfile(options);
+  const browser = await chromium.launch({ headless: true });
+
+  const contextOptions = { ...deviceProfile };
+  if (storageStatePath && fs.existsSync(storageStatePath)) {
+    contextOptions.storageState = storageStatePath;
+  }
+  const context = await browser.newContext(contextOptions);
+  const page = await context.newPage();
+
+  try {
+    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+    // Give lazy-loaded/hydrating content a brief window to settle - a
+    // snapshot taken mid-hydration would reproduce the exact "looks empty
+    // until scrolled into view" gap that caused the selector failures this
+    // endpoint exists to prevent.
+    await page.waitForTimeout(1000);
+
+    const summary = await page.evaluate((maxElementsPerType) => {
+      function isVisible(el) {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      }
+      function shortText(el) {
+        return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120) || undefined;
+      }
+      // Collects up to maxElementsPerType visible matches, collapsing exact
+      // duplicates - real pages commonly repeat the same link/product
+      // across multiple sections (e.g. a homepage's "Latest Arrivals" AND
+      // "Top Picks" both listing the same item), and the planner only
+      // needs to see it once to know it exists.
+      function pick(selectorList, mapFn) {
+        const seen = new Set();
+        const out = [];
+        for (const el of document.querySelectorAll(selectorList)) {
+          if (out.length >= maxElementsPerType) break;
+          if (!isVisible(el)) continue;
+          const item = mapFn(el);
+          const key = JSON.stringify(item);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(item);
+        }
+        return out;
+      }
+
+      return {
+        title: document.title,
+        links: pick('a[href]', (el) => ({ text: shortText(el), href: el.href, id: el.id || undefined })),
+        buttons: pick('button, [role="button"], input[type="submit"], input[type="button"]', (el) => ({
+          text: shortText(el) || el.value || el.getAttribute('aria-label') || undefined,
+          id: el.id || undefined,
+        })),
+        inputs: pick('input:not([type="hidden"]), textarea, select', (el) => ({
+          type: el.tagName === 'SELECT' ? 'select' : (el.type || 'text'),
+          name: el.name || undefined,
+          id: el.id || undefined,
+          placeholder: el.placeholder || undefined,
+          ariaLabel: el.getAttribute('aria-label') || undefined,
+        })),
+        images: pick('img[alt]:not([alt=""])', (el) => ({ alt: el.alt, src: el.currentSrc || el.src })),
+      };
+    }, maxElementsPerType);
+
+    const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    return { url: page.url(), pageHeight, viewport: deviceProfile.viewport, ...summary };
+  } finally {
+    await browser.close();
+  }
+}
+
 /**
  * Runs a one-off login (or any action list) with NO video recording, then
  * saves the resulting cookies/localStorage to storageStatePath. The actual
@@ -684,4 +778,4 @@ async function createSession({ actions, options = {}, storageStatePath, onLog = 
   }
 }
 
-module.exports = { runRecordingJob, createSession };
+module.exports = { runRecordingJob, createSession, inspectPage };
