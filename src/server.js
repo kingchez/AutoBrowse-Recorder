@@ -74,9 +74,10 @@ function validateActions(actions) {
 }
 
 // In-memory job registry: id -> { status, log, createdAt, outputPath?, screenshots?, error? }
-// status is one of: "pending" | "processing" | "done" | "error"
-// ("done"/"error" mirror the render server's terminology; "error" jobs can
-// still have an outputPath if the recording got partway before failing.)
+// status is one of: "pending" | "processing" | "done" | "partial" | "error"
+// ("partial" = an action failed but real video exists/is coming; "error" is
+// reserved for a hard failure with no video at all, e.g. Chromium never
+// launched)
 const jobs = new Map();
 
 function cleanup(jobId) {
@@ -183,7 +184,7 @@ function recoverJobsFromDisk() {
     }
 
     jobs.set(id, {
-      status: meta.actionError ? 'error' : 'done',
+      status: meta.actionError ? 'partial' : 'done',
       log: meta.log || [],
       createdAt: meta.createdAt || finishedAtMs,
       outputPath,
@@ -243,17 +244,24 @@ app.post('/record', (req, res) => {
   // render server - a partial video may still show up moments later. No
   // output_url in this payload yet, so fireCallback won't delete the job -
   // it's still mid-encode.
+  //
+  // Status is "partial", not "error": an action failing partway through
+  // still leaves real, watchable video up to that point (the finalize/
+  // ffmpeg step always runs right after this fires) - that's meaningfully
+  // different from a job that produced nothing at all, and a consumer
+  // reacting to this webhook needs to be able to tell those two cases
+  // apart rather than treating every action failure as a hard error.
   const onActionError = (message, failedAtIndex) => {
-    job.status = 'error';
+    job.status = 'partial';
     job.error = message;
     job.failedAtIndex = failedAtIndex;
     saveMeta(jobId);
-    fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: message });
+    fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'partial', error: message });
   };
 
   runRecordingJob({ actions, options, jobDir: dir, onLog, storageStatePath, onActionError })
     .then(({ outputPath, screenshots, actionError }) => {
-      job.status = actionError ? 'error' : 'done';
+      job.status = actionError ? 'partial' : 'done';
       job.outputPath = outputPath;
       job.screenshots = screenshots;
       if (actionError) job.error = actionError;
@@ -261,19 +269,21 @@ app.post('/record', (req, res) => {
 
       const output_url = `${PUBLIC_BASE_URL}/recordings/${jobId}/output`;
       if (actionError) {
-        // Follow-up to the instant error notice above - same status, now
+        // Follow-up to the instant partial notice above - same status, now
         // with the partial video actually ready to fetch. The job stays in
         // memory even after this delivers successfully, since output_url
         // is present - actual cleanup happens once /output is fetched.
-        fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'error', error: actionError, output_url });
+        fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'partial', error: actionError, output_url });
       } else {
         fireCallbackSafely(callbackUrl, { source: 'autobrowse', job_id: jobId, status: 'done', output_url });
       }
     })
     .catch((err) => {
       // A hard failure with no usable video at all (e.g. Chromium itself
-      // never launched) - nothing to deliver, ever. Single callback, no
-      // output_url, delete on success (nothing more is coming).
+      // never launched) - nothing to deliver, ever. This is the ONLY case
+      // that still reports "error": every other failure mode above still
+      // has a video, so it's reported as "partial" instead. Single
+      // callback, no output_url, delete on success (nothing more is coming).
       job.status = 'error';
       job.error = err.message;
       onLog(`FATAL: ${err.message}`);
