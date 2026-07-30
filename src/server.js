@@ -292,20 +292,40 @@ app.post('/record', (req, res) => {
     });
 });
 
-// POST /inspect  { url: "...", options?: {...}, session?: "name" }
+// POST /inspect  { url: "...", steps?: [...], options?: {...}, session?: "name" }
 // Synchronous (no job id, no polling) - navigates once, returns a pruned
 // list of the page's actual interactive elements (links/buttons/inputs/
 // images with alt text) so an action-planning step can generate selectors
 // grounded in the real DOM instead of guessing. Meant to run as a step
 // BEFORE building the actions array for POST /record, not during it -
-// call this once per page you're about to plan for, feed the result to
-// whatever generates your actions JSON, then call /record with the
-// selectors it comes back with.
+// call this once per page (or page-to-page journey, via `steps`) you're
+// about to plan for, feed the result to whatever generates your actions
+// JSON, then call /record with the selectors it comes back with.
+//
+// `steps`, if given, is a chain of navigation-only actions (goto/click/
+// scroll/waitForSelector/pressKey/search/zoomIn/zoomOut) walked in order
+// AFTER the initial `url`, with a fresh element snapshot taken after each
+// one - for grounding a click-through flow (e.g. "click Shop, then click a
+// product") in every real page it actually reaches, not just the first.
 app.post('/inspect', async (req, res) => {
-  const { url, options, session, maxElementsPerType } = req.body || {};
+  const { url, steps, options, session, maxElementsPerType } = req.body || {};
 
   if (!url || typeof url !== 'string') {
     return res.status(400).json({ error: 'Body must include a "url" string' });
+  }
+
+  const stepList = Array.isArray(steps) ? steps : [];
+  if (stepList.length > 0) {
+    const disallowed = stepList.some((s) => s && (s.type === 'screenshot' || (s.type === 'highlight' && s.captureScreenshot)));
+    if (disallowed) {
+      return res.status(400).json({
+        error: '"steps" cannot include "screenshot" actions, or "highlight" actions with captureScreenshot - inspection has no job directory to save files into. Use POST /record for anything that needs to persist a file.',
+      });
+    }
+    const stepErrors = validateActions(stepList);
+    if (stepErrors.length > 0) {
+      return res.status(400).json({ error: 'Invalid steps', details: stepErrors });
+    }
   }
 
   let storageStatePath = null;
@@ -321,7 +341,7 @@ app.post('/inspect', async (req, res) => {
   }
 
   try {
-    const result = await inspectPage({ url, options, storageStatePath, maxElementsPerType });
+    const result = await inspectPage({ url, steps: stepList, options, storageStatePath, maxElementsPerType });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });

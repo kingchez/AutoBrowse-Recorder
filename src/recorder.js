@@ -481,6 +481,21 @@ async function runAction(page, action) {
         });
         document.body.appendChild(div);
       }, { box, color });
+
+      // Optional still capture WHILE the highlight is visible, before this
+      // action's own cleanup removes it below. A separate `screenshot`
+      // action run right after `highlight` would always show the overlay
+      // already gone - each action's cleanup runs to completion before the
+      // next action starts, so there's no window for a later action to
+      // catch it. Set `captureScreenshot: true` here instead of relying on
+      // a follow-up screenshot action, for exactly this reason.
+      if (action.captureScreenshot) {
+        const filename = action.screenshotFilename || `highlight-${Date.now()}.png`;
+        const filePath = path.join(action._jobDir, filename);
+        await page.screenshot({ path: filePath, fullPage: action.fullPage || false });
+        if (typeof action._onScreenshot === 'function') action._onScreenshot(filename);
+      }
+
       await page.waitForTimeout(durationMs);
       await page.evaluate(() => {
         document.querySelectorAll('[data-autobrowse-highlight]').forEach((el) => el.remove());
@@ -544,11 +559,25 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
 
   const contextOptions = {
     ...deviceProfile,
-    // Video is recorded at the same logical size as the viewport. Chromium
-    // still renders internally at deviceScaleFactor resolution, so text and
-    // edges come out anti-aliased/sharper than a flat 1x capture even
-    // though the final pixel dimensions match the viewport.
-    recordVideo: { dir: jobDir, size: deviceProfile.viewport },
+    // Video output is captured at PHYSICAL pixel dimensions (viewport x
+    // deviceScaleFactor), not the logical viewport size. Chromium already
+    // renders internally at the higher density regardless (that's what
+    // deviceScaleFactor does), but Playwright's recordVideo.size caps the
+    // OUTPUT video to whatever size is given here - leaving it at the
+    // logical viewport size was silently downsampling every recording back
+    // down to 1x, throwing away the sharper detail Chromium had already
+    // rendered. This matters a lot for footage that gets cropped/zoomed
+    // inside a Remotion composition afterward - extra source resolution is
+    // the difference between a clean crop and a visibly soft one.
+    // Trade-off: roughly 4x the pixel count of a 1x capture (2x width x 2x
+    // height), so meaningfully bigger files and longer ffmpeg encodes.
+    recordVideo: {
+      dir: jobDir,
+      size: {
+        width: Math.round(deviceProfile.viewport.width * (deviceProfile.deviceScaleFactor || 1)),
+        height: Math.round(deviceProfile.viewport.height * (deviceProfile.deviceScaleFactor || 1)),
+      },
+    },
   };
   if (storageStatePath && fs.existsSync(storageStatePath)) {
     onLog('Reusing saved session cookies');
@@ -572,8 +601,12 @@ async function runRecordingJob({ actions, options = {}, jobDir, onLog = () => {}
   for (const [i, action] of actions.entries()) {
     onLog(`Action ${i + 1}/${actions.length}: ${action.type}`);
     try {
-      // Inject job dir + screenshot tracking without requiring the caller to know about it.
-      const enrichedAction = action.type === 'screenshot'
+      // Inject job dir + screenshot tracking without requiring the caller to
+      // know about it - needed for plain `screenshot` actions, and for
+      // `highlight` actions that opt into `captureScreenshot`.
+      const needsScreenshotContext = action.type === 'screenshot'
+        || (action.type === 'highlight' && action.captureScreenshot);
+      const enrichedAction = needsScreenshotContext
         ? { ...action, _jobDir: jobDir, _onScreenshot: (name) => screenshots.push(name) }
         : action;
 
@@ -673,7 +706,21 @@ function convertToMp4(inputPath, outputPath, trimSeconds = 0) {
 // storageStatePath as runRecordingJob, so a saved session (POST
 // /sessions) works identically here - inspecting a page that requires
 // sign-in sees the same authenticated DOM the actual recording job would.
-async function inspectPage({ url, options = {}, storageStatePath = null, maxElementsPerType = 60 }) {
+//
+// `steps` (optional): a chain of navigation-only actions (goto/click/
+// scroll/waitForSelector/pressKey/search/zoomIn/zoomOut - not screenshot or
+// a highlight with captureScreenshot, since inspection has no job
+// directory to save files into) run in sequence on the SAME page/session
+// AFTER the initial goto, with a fresh snapshot taken after every single
+// step - not just once at the end. This is what makes a "click a button,
+// see what's on the next page" flow inspectable: without it, only the
+// starting page is ever grounded in real data, and every selector for
+// anything reached by clicking through is still a guess. Each entry in the
+// returned `pages` array is one step's resulting page state; a step that
+// fails stops the chain there (same "return what's real so far, don't
+// throw everything away" philosophy as a recording job's action failures)
+// rather than either skipping it or aborting the whole request.
+async function inspectPage({ url, steps = [], options = {}, storageStatePath = null, maxElementsPerType = 60 }) {
   const deviceProfile = resolveDeviceProfile(options);
   const browser = await chromium.launch({ headless: true });
 
@@ -684,8 +731,7 @@ async function inspectPage({ url, options = {}, storageStatePath = null, maxElem
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
 
-  try {
-    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+  async function snapshotCurrentPage() {
     // Give lazy-loaded/hydrating content a brief window to settle - a
     // snapshot taken mid-hydration would reproduce the exact "looks empty
     // until scrolled into view" gap that caused the selector failures this
@@ -742,6 +788,28 @@ async function inspectPage({ url, options = {}, storageStatePath = null, maxElem
 
     const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
     return { url: page.url(), pageHeight, viewport: deviceProfile.viewport, ...summary };
+  }
+
+  try {
+    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+    const pages = [{ step: 0, action: { type: 'goto', url }, ...(await snapshotCurrentPage()) }];
+
+    for (const [i, step] of steps.entries()) {
+      try {
+        await runAction(page, step); // same click/scroll/waitForSelector/etc logic a real recording uses
+        pages.push({ step: i + 1, action: step, ...(await snapshotCurrentPage()) });
+      } catch (err) {
+        pages.push({ step: i + 1, action: step, error: err.message });
+        break; // can't meaningfully keep inspecting past a step that didn't actually happen
+      }
+    }
+
+    // Top-level fields mirror the last page reached, for backward
+    // compatibility with a caller that only passes a bare `url` (no
+    // `steps`) and expects the original single-page response shape.
+    // `pages` is always present (exactly one entry when no steps were
+    // given) and is where a multi-step chain's full journey lives.
+    return { ...pages[pages.length - 1], pages };
   } finally {
     await browser.close();
   }
